@@ -54,8 +54,12 @@ from app.servicenow import ServiceNowClient, ServiceNowError  # noqa: E402
 from app.state import (  # noqa: E402
     ConversationPhase,
     ConversationState,
+    InMemoryStateRepository,
+    StateKey,
     clear_session,
+    configure_state_repository,
     get_session,
+    get_state_repository,
     save_session,
 )
 from app.tools.servicenow import (  # noqa: E402
@@ -67,6 +71,8 @@ from app.tools.servicenow import (  # noqa: E402
 TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 OTHER_TENANT = "00000000-0000-0000-0000-000000000000"
 USER = "bl007-user-aad-oid"
+# DEMO-01: the conversation-state key app.main derives from _context().
+STATE_KEY = StateKey(TENANT, USER)
 
 FULL_MESSAGE = (
     "VPN is down for me and I can't access internal applications. "
@@ -93,8 +99,13 @@ def _context(text: str, user_id: str = USER, tenant: str | None = TENANT):
 class _Base(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
-        clear_session(USER)
-        self.addCleanup(clear_session, USER)
+        # DEMO-01: state is keyed by tenant + user + conversation, so each
+        # test starts from an empty store (no state leaks between tests).
+        previous_repo = get_state_repository()
+        configure_state_repository(InMemoryStateRepository())
+        self.addCleanup(configure_state_repository, previous_repo)
+        clear_session(STATE_KEY)
+        self.addCleanup(clear_session, STATE_KEY)
 
         # Real gateway over a mocked ServiceNow client.
         self.client = AsyncMock()
@@ -119,14 +130,14 @@ class _Base(unittest.IsolatedAsyncioTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _ready(self, **overrides) -> ConversationState:
+    def _ready(self, state_key=STATE_KEY, **overrides) -> ConversationState:
         """Put USER in READY_FOR_CONFIRMATION via the real BL-006 collector."""
         state = ConversationState()
         start_incident_collection(state, FULL_MESSAGE)
         assert state.phase is ConversationPhase.READY_FOR_CONFIRMATION
         for key, value in overrides.items():
             setattr(state, key, value)
-        save_session(USER, state)
+        save_session(state_key, state)
         return state
 
     async def _send(self, text: str, **ctx_kwargs) -> str:
@@ -150,12 +161,12 @@ class TestConfirmationBoundary(_Base):
         await self._send("My laptop VPN isn't connecting.")
         await self._send("2")
         reply = await self._send("1")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
         self.assertIn("Shall I create this incident?", reply)
         self.client.create_incident.assert_not_called()
 
         reply = await self._send("yes")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.COMPLETED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.COMPLETED)
         self.assertIn("INC0012345", reply)
         self.client.create_incident.assert_awaited_once_with(
             short_description="My laptop VPN isn't connecting",
@@ -170,19 +181,19 @@ class TestConfirmationBoundary(_Base):
                           wraps=main.evaluate_confirmation) as gate:
             await self._send("yes")
         gate.assert_called_once()
-        self.assertIs(gate.call_args.args[0], get_session(USER))
+        self.assertIs(gate.call_args.args[0], get_session(STATE_KEY))
         self.assertEqual(gate.call_args.args[1], "yes")
 
     async def test_03_explicit_confirmations_proceed(self):
         for phrase in ("yes", "confirm", "create it", "go ahead", "proceed",
                        "submit it", "do it", "approved", "  YES  "):
             with self.subTest(phrase=phrase):
-                clear_session(USER)
+                clear_session(STATE_KEY)
                 self.client.create_incident.reset_mock()
                 self._ready()
                 await self._send(phrase)
                 self.client.create_incident.assert_awaited_once()
-                self.assertEqual(get_session(USER).phase, ConversationPhase.COMPLETED)
+                self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.COMPLETED)
 
     async def test_04_ambiguous_responses_do_not_execute(self):
         self._ready()
@@ -191,7 +202,7 @@ class TestConfirmationBoundary(_Base):
             with self.subTest(phrase=phrase):
                 reply = await self._send(phrase)
                 self.assertIn("explicit confirmation", reply)
-                self.assertEqual(get_session(USER).phase,
+                self.assertEqual(get_session(STATE_KEY).phase,
                                  ConversationPhase.READY_FOR_CONFIRMATION)
         self.client.create_incident.assert_not_called()
         self.classify.assert_not_called()
@@ -199,11 +210,11 @@ class TestConfirmationBoundary(_Base):
     async def test_05_cancellation_does_not_execute(self):
         for phrase in ("cancel", "no", "stop", "abort", "never mind", "don't create it"):
             with self.subTest(phrase=phrase):
-                clear_session(USER)
+                clear_session(STATE_KEY)
                 self._ready()
                 reply = await self._send(phrase)
                 self.assertIn("Cancelled", reply)
-                session = get_session(USER)
+                session = get_session(STATE_KEY)
                 self.assertEqual(session.phase, ConversationPhase.IDLE)
                 self.assertEqual(session.collected_details, {})
         self.client.create_incident.assert_not_called()
@@ -253,20 +264,24 @@ class TestIdentityAndAuthorization(_Base):
         self.assertTrue(decision.allowed)
         self.assertIs(decision.action, AuthorizableAction.CREATE_INCIDENT)
 
-    async def _assert_denied(self, **ctx_kwargs):
-        self._ready()
+    async def _assert_denied(self, state_key=STATE_KEY, **ctx_kwargs):
+        self._ready(state_key)
         with patch.object(self.gateway, "execute", AsyncMock()) as execute:
             reply = await self._send("yes", **ctx_kwargs)
         self.assertIn("not authorised", reply)
         execute.assert_not_called()
         self.client.create_incident.assert_not_called()
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(state_key).phase, ConversationPhase.READY_FOR_CONFIRMATION)
 
     async def test_08_wrong_tenant_denied(self):
-        await self._assert_denied(tenant=OTHER_TENANT)
+        # DEMO-01: state is tenant-scoped, so the message's tenant is the
+        # conversation's tenant; it is denied because it is not the allowed one.
+        with patch.dict("os.environ", {"TEAMS_TENANT_ID": OTHER_TENANT}):
+            await self._assert_denied()
 
     async def test_08b_missing_tenant_denied(self):
-        await self._assert_denied(tenant=None)
+        # DEMO-01: a tenantless conversation has its own (tenant "") state.
+        await self._assert_denied(StateKey("", USER), tenant=None)
 
     async def test_08c_unconfigured_allowed_tenant_denied(self):
         with patch.dict("os.environ", {"TEAMS_TENANT_ID": ""}):
@@ -279,9 +294,10 @@ class TestIdentityAndAuthorization(_Base):
             await self._assert_denied()
 
     async def test_08e_denied_user_can_still_cancel(self):
-        await self._assert_denied(tenant=OTHER_TENANT)
+        with patch.dict("os.environ", {"TEAMS_TENANT_ID": OTHER_TENANT}):
+            await self._assert_denied()
         await self._send("cancel")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
         self.client.create_incident.assert_not_called()
 
 
@@ -295,7 +311,7 @@ class TestExecutionContract(_Base):
         seen = {}
 
         async def create(**kwargs):
-            seen["phase"] = get_session(USER).phase
+            seen["phase"] = get_session(STATE_KEY).phase
             return dict(CREATED)
 
         self.client.create_incident.side_effect = create
@@ -358,7 +374,7 @@ class TestExecutionContract(_Base):
         self.assertNotIn("✅", reply)
         execute.assert_not_called()
         self.client.create_incident.assert_not_called()
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.IDLE)
         self.assertIsNone(session.pending_action)
 
@@ -389,7 +405,7 @@ class TestExecutionContract(_Base):
         for field, bad in (("impact", "5"), ("urgency", "4"), ("impact", "high"),
                            ("short_description", "x" * 161), ("description", "   ")):
             with self.subTest(field=field, bad=bad):
-                clear_session(USER)
+                clear_session(STATE_KEY)
                 await self._assert_blocked({**EXPECTED_FIELDS, field: bad})
 
     async def test_14e_wrong_pending_action_blocks(self):
@@ -414,7 +430,7 @@ class TestResults(_Base):
         self.client.create_incident.return_value = {"sys_id": "z", "number": "INC0099887"}
         self._ready()
         reply = await self._send("yes")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COMPLETED)
         self.assertEqual(session.incident_number, "INC0099887")
         self.assertIn("INC0099887", reply)
@@ -425,7 +441,7 @@ class TestResults(_Base):
         self.client.create_incident.return_value = {"sys_id": "z"}
         self._ready()
         reply = await self._send("yes")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COMPLETED)
         self.assertIsNone(session.incident_number)
         self.assertIn("did not return an incident number", reply)
@@ -438,7 +454,7 @@ class TestResults(_Base):
         )
         self._ready()
         reply = await self._send("yes")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.FAILED)
         self.assertIsNone(session.incident_number)
         self.assertEqual(session.last_error, "Failed to create incident in ServiceNow.")
@@ -453,7 +469,7 @@ class TestResults(_Base):
         with patch.object(self.gateway, "execute",
                           AsyncMock(side_effect=RuntimeError("password=hunter2"))):
             reply = await self._send("yes")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.FAILED)
         self.assertNotIn("hunter2", reply)
         self.assertNotIn("✅", reply)
@@ -465,7 +481,7 @@ class TestResults(_Base):
                           side_effect=lambda **kw: CreateIncidentToolRequest(
                               **{**kw, "impact": "9"})):
             reply = await self._send("yes")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
         self.assertIn("could not be created", reply)
         self.client.create_incident.assert_not_called()
 
@@ -497,7 +513,7 @@ class TestNoRetryNoDuplicates(_Base):
         await self._send("yes")
         await self._send("confirm")
         self.assertEqual(self.client.create_incident.await_count, 1)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
 
     async def test_21_repeated_confirmation_after_success(self):
         self._ready()
@@ -505,7 +521,7 @@ class TestNoRetryNoDuplicates(_Base):
         await self._send("yes")
         await self._send("go ahead")
         self.assertEqual(self.client.create_incident.await_count, 1)
-        self.assertEqual(get_session(USER).incident_number, "INC0012345")
+        self.assertEqual(get_session(STATE_KEY).incident_number, "INC0012345")
 
     async def test_21b_concurrent_confirmations_create_once(self):
         release = asyncio.Event()
@@ -519,7 +535,7 @@ class TestNoRetryNoDuplicates(_Base):
         first_ctx, second_ctx = _context("yes"), _context("yes")
         first = asyncio.create_task(main.on_message(first_ctx))
         for _ in range(1000):
-            if get_session(USER).phase is ConversationPhase.EXECUTING:
+            if get_session(STATE_KEY).phase is ConversationPhase.EXECUTING:
                 break
             await asyncio.sleep(0)
         else:
@@ -537,7 +553,7 @@ class TestNoRetryNoDuplicates(_Base):
 
     async def test_21c_executing_phase_never_reaches_llm_or_gateway(self):
         self._ready()
-        get_session(USER).transition_to(ConversationPhase.EXECUTING)
+        get_session(STATE_KEY).transition_to(ConversationPhase.EXECUTING)
         with patch.object(self.gateway, "execute", AsyncMock()) as execute:
             reply = await self._send("yes")
         self.assertIn("still being created", reply)
@@ -545,7 +561,7 @@ class TestNoRetryNoDuplicates(_Base):
         self.classify.assert_not_called()
 
     async def test_21d_users_are_isolated(self):
-        other = "bl007-other-user"
+        other = StateKey(TENANT, "bl007-other-user")
         self.addCleanup(clear_session, other)
         self._ready()
         other_state = ConversationState()
@@ -553,7 +569,7 @@ class TestNoRetryNoDuplicates(_Base):
         save_session(other, other_state)
 
         await self._send("yes")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.COMPLETED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.COMPLETED)
         self.assertEqual(get_session(other).phase, ConversationPhase.READY_FOR_CONFIRMATION)
         self.assertIsNone(get_session(other).incident_number)
         self.assertEqual(self.client.create_incident.await_count, 1)
@@ -565,7 +581,7 @@ class TestNoRetryNoDuplicates(_Base):
         self._ready()
         await self._send("yes")
         await self._send("Please raise a ticket.")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COLLECTING)
         self.assertIsNone(session.incident_number)
         await self._send("yes")  # a word, not a confirmation, while collecting

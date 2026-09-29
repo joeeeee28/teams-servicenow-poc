@@ -54,8 +54,12 @@ from app.servicenow import (  # noqa: E402
 from app.state import (  # noqa: E402
     ConversationPhase,
     ConversationState,
+    InMemoryStateRepository,
+    StateKey,
     clear_session,
+    configure_state_repository,
     get_session,
+    get_state_repository,
     save_session,
 )
 from app.tools.servicenow import (  # noqa: E402
@@ -69,6 +73,8 @@ from app.tools.servicenow import (  # noqa: E402
 TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 OTHER_TENANT = "00000000-0000-0000-0000-000000000000"
 USER = "bl008-user-aad-oid"
+# DEMO-01: the conversation-state key app.main derives from _context().
+STATE_KEY = StateKey(TENANT, USER)
 
 EMPLOYEE = UserIdentity(
     user_id=USER,
@@ -348,8 +354,13 @@ class TestFormatting(unittest.TestCase):
 class TestMainIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
-        clear_session(USER)
-        self.addCleanup(clear_session, USER)
+        # DEMO-01: state is keyed by tenant + user + conversation, so each
+        # test starts from an empty store (no state leaks between tests).
+        previous_repo = get_state_repository()
+        configure_state_repository(InMemoryStateRepository())
+        self.addCleanup(configure_state_repository, previous_repo)
+        clear_session(STATE_KEY)
+        self.addCleanup(clear_session, STATE_KEY)
 
         self.client = AsyncMock()
         self.client.get_incident.return_value = dict(RECORD)
@@ -431,7 +442,7 @@ class TestMainIntegration(unittest.IsolatedAsyncioTestCase):
         self.client.get_incident.assert_not_called()
 
     async def test_20_no_confirmation_and_no_state_change(self):
-        before = get_session(USER)
+        before = get_session(STATE_KEY)
         seen = []
         original = ConversationState.transition_to
 
@@ -441,7 +452,7 @@ class TestMainIntegration(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(ConversationState, "transition_to", spy):
             reply = await self._send("INC0010002")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(seen, [])
         self.assertEqual(session.phase, ConversationPhase.IDLE)
         self.assertIsNone(session.pending_action)
@@ -470,7 +481,7 @@ class TestMainIntegration(unittest.IsolatedAsyncioTestCase):
         start_incident_collection(
             state, "VPN is down for me. Impact is 2 and urgency is 1."
         )
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         reply = await self._send("yes")
         self.assertIn("INC0012345", reply)
         self.client.create_incident.assert_awaited_once()
@@ -479,7 +490,7 @@ class TestMainIntegration(unittest.IsolatedAsyncioTestCase):
         # Lookup after completion is read-only and leaves the result intact.
         reply = await self._send("INC0010002")
         self.assertIn("VPN unavailable", reply)
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COMPLETED)
         self.assertEqual(session.incident_number, "INC0012345")
         self.client.create_incident.assert_awaited_once()
@@ -489,19 +500,19 @@ class TestMainIntegration(unittest.IsolatedAsyncioTestCase):
         start_incident_collection(
             state, "VPN is down for me. Impact is 2 and urgency is 1."
         )
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         reply = await self._send("INC0010002")
         self.assertIn("explicit confirmation", reply)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
         self.client.get_incident.assert_not_called()
         self.client.create_incident.assert_not_called()
 
     async def test_21c_incident_number_during_collection_goes_to_collector(self):
         state = ConversationState()
         start_incident_collection(state, "I need to report an issue")
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         await self._send("INC0010002")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COLLECTING)
         self.assertIn("INC0010002", session.collected_details.get("description", ""))
         self.client.get_incident.assert_not_called()

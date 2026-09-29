@@ -49,9 +49,13 @@ It is a pure orchestration primitive.
 
 PERSISTENCE BOUNDARY
 ────────────────────
-``StateRepository`` is an abstract base class so that a future Redis or
-PostgreSQL repository can replace ``InMemoryStateRepository`` without
-touching any other module.
+``StateRepository`` is an abstract base class keyed by ``StateKey``
+(tenant + user + conversation).  ``InMemoryStateRepository`` is the
+test/dev implementation; ``app.state_store.SqliteStateRepository``
+(DEMO-01) persists state across restarts.  The application selects the
+repository explicitly at startup via ``configure_state_repository()``.
+Repository failures raise ``StatePersistenceError`` — callers fail safe and
+never fall back to another store.
 
 SECURITY
 ────────
@@ -61,10 +65,12 @@ No user message content, credentials, or tokens are logged here.
 from __future__ import annotations
 
 import abc
+import hashlib
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Union
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +164,84 @@ class InvalidTransitionError(Exception):
         )
 
 
+class StatePersistenceError(Exception):
+    """
+    Raised when conversation state cannot be loaded, saved or cleared
+    (DEMO-01).
+
+    ``operation`` is ``"load"``, ``"save"`` or ``"clear"``.  The message is
+    fixed text — it never contains state content, identifiers or driver
+    error details.
+    """
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        super().__init__(f"conversation state {operation} failed")
+
+
+# ===========================================================================
+# State key (DEMO-01)
+# ===========================================================================
+
+_MAX_KEY_PART_LENGTH = 512
+
+
+def _key_ref(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8] if value else "-"
+
+
+@dataclass(frozen=True)
+class StateKey:
+    """
+    Identifies one conversation's state: tenant + user + conversation.
+
+    Two keys that differ in any part address completely separate state, so a
+    message from another tenant, another user or another conversation can
+    never read or change this conversation's pending action.
+
+    ``tenant_id`` and ``conversation_id`` may be ``""`` when the channel does
+    not supply them; ``user_id`` is required.  ``repr`` shows only short
+    hashes so a key can never leak identifiers into logs.
+    """
+
+    tenant_id: str
+    user_id: str
+    conversation_id: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("tenant_id", "user_id", "conversation_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) > _MAX_KEY_PART_LENGTH:
+                raise ValueError(f"StateKey.{name} must be a string of at most "
+                                 f"{_MAX_KEY_PART_LENGTH} characters")
+        if not self.user_id.strip():
+            raise ValueError("StateKey.user_id is required")
+
+    @classmethod
+    def legacy(cls, user_id: str) -> "StateKey":
+        """Key for callers that address state by user id only."""
+        return cls(tenant_id="", user_id=user_id, conversation_id="")
+
+    def __repr__(self) -> str:
+        return (f"StateKey(tenant={_key_ref(self.tenant_id)}, "
+                f"user={_key_ref(self.user_id)}, "
+                f"conversation={_key_ref(self.conversation_id)})")
+
+    __str__ = __repr__
+
+
+StateKeyLike = Union[StateKey, str]
+
+
+def coerce_state_key(key: StateKeyLike) -> StateKey:
+    """Accept a ``StateKey`` or a legacy user-id string."""
+    if isinstance(key, StateKey):
+        return key
+    if isinstance(key, str):
+        return StateKey.legacy(key)
+    raise TypeError("state key must be a StateKey or a user id string")
+
+
 # ===========================================================================
 # Passive transition listeners (BL-011 observability)
 # ===========================================================================
@@ -223,6 +307,10 @@ class ConversationState:
         Audit correlation identifier (BL-010) shared by every audit event of
         one logical operation (request → confirmation → execution), which
         spans several Teams messages.  Cleared on reset to ``IDLE``.
+
+    created_at / updated_at
+        UTC timestamps maintained by the repository on save (DEMO-01).
+        ``None`` until the state is first saved.  Not cleared on reset.
     """
 
     phase: ConversationPhase = ConversationPhase.IDLE
@@ -233,6 +321,8 @@ class ConversationState:
     incident_number: str | None = None
     last_error: str | None = None
     correlation_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     def transition_to(self, new_phase: ConversationPhase) -> "ConversationState":
         """
@@ -278,98 +368,117 @@ class ConversationState:
 
 class StateRepository(abc.ABC):
     """
-    Abstract repository for ``ConversationState`` keyed by user/session ID.
+    Abstract repository for ``ConversationState`` keyed by ``StateKey``
+    (tenant + user + conversation).  A plain string is accepted as a legacy
+    user-id key (``StateKey.legacy``).
 
-    Implementations must guarantee isolation between different user IDs:
-    fetching or modifying user A's state must never affect user B's state.
+    Implementations must guarantee isolation between keys: fetching or
+    modifying one key's state must never affect another key's state.
+    Implementations report storage failures as ``StatePersistenceError``.
     """
 
     @abc.abstractmethod
-    def get(self, user_id: str) -> ConversationState:
+    def get(self, key: StateKeyLike) -> ConversationState:
         """
-        Return the ``ConversationState`` for *user_id*.
+        Return the ``ConversationState`` for *key*.
 
         If no state exists yet, a new ``ConversationState()`` (in ``IDLE``)
-        is created, persisted, and returned.
+        is returned.  Persistent implementations return a copy; changes are
+        stored only by ``save()``.
         """
 
     @abc.abstractmethod
-    def save(self, user_id: str, state: ConversationState) -> None:
-        """Persist *state* for *user_id*."""
+    def save(self, key: StateKeyLike, state: ConversationState) -> None:
+        """Persist *state* for *key*."""
 
     @abc.abstractmethod
-    def clear(self, user_id: str) -> None:
+    def clear(self, key: StateKeyLike) -> None:
         """
-        Remove the state for *user_id*.
+        Remove the state for *key*.
 
-        After this call, ``get(user_id)`` must return a fresh
+        After this call, ``get(key)`` must return a fresh
         ``ConversationState()`` in ``IDLE``.
         """
 
 
 # ===========================================================================
-# In-memory implementation (POC)
+# In-memory implementation (tests / local development)
 # ===========================================================================
 
 class InMemoryStateRepository(StateRepository):
     """
-    In-memory ``StateRepository`` for use during the POC phase.
+    In-memory ``StateRepository`` for tests and local development.
 
-    POC ONLY — this will be replaced with a persistent implementation
-    (Redis, PostgreSQL, etc.) without changing the ``StateRepository``
-    interface.
+    State is lost on restart.  The running application uses the persistent
+    ``app.state_store.SqliteStateRepository`` unless ``STATE_STORE=memory``
+    is set explicitly.
     """
 
     def __init__(self) -> None:
         # Private — never access _store from outside tests.
-        self._store: dict[str, ConversationState] = {}
+        self._store: dict[StateKey, ConversationState] = {}
 
-    def get(self, user_id: str) -> ConversationState:
-        if user_id not in self._store:
-            self._store[user_id] = ConversationState()
-        return self._store[user_id]
+    def get(self, key: StateKeyLike) -> ConversationState:
+        key = coerce_state_key(key)
+        if key not in self._store:
+            self._store[key] = ConversationState()
+        return self._store[key]
 
-    def save(self, user_id: str, state: ConversationState) -> None:
-        self._store[user_id] = state
+    def save(self, key: StateKeyLike, state: ConversationState) -> None:
+        self._store[coerce_state_key(key)] = state
 
-    def clear(self, user_id: str) -> None:
-        self._store.pop(user_id, None)
+    def clear(self, key: StateKeyLike) -> None:
+        self._store.pop(coerce_state_key(key), None)
 
 
 # ===========================================================================
-# Module-level default repository (singleton for the POC)
+# Module-level default repository
 # ===========================================================================
 
-# This single instance is used by the module-level helper functions below.
-# Tests that need isolation should instantiate their own InMemoryStateRepository
-# rather than relying on this singleton.
+# In-memory until the application configures its repository at startup
+# (app.main lifespan → app.state_store.create_state_repository).  Tests that
+# need isolation should instantiate their own repository.
 _default_repo: StateRepository = InMemoryStateRepository()
+
+
+def configure_state_repository(repo: StateRepository) -> None:
+    """Select the repository used by the module-level helpers."""
+    global _default_repo
+    if not isinstance(repo, StateRepository):
+        raise TypeError("repo must be a StateRepository")
+    _default_repo = repo
+
+
+def get_state_repository() -> StateRepository:
+    """The repository currently used by the module-level helpers."""
+    return _default_repo
 
 
 # ===========================================================================
 # Module-level helper functions (backward-compatible surface)
 # ===========================================================================
 
-def get_session(user_id: str) -> ConversationState:
+def get_session(user_id: StateKeyLike) -> ConversationState:
     """
-    Return the ``ConversationState`` for *user_id* from the default
-    repository.  Creates a new IDLE state if none exists.
+    Return the ``ConversationState`` for *user_id* (a ``StateKey`` or a
+    legacy user-id string) from the default repository.  Returns a new IDLE
+    state if none exists.
     """
     return _default_repo.get(user_id)
 
 
-def save_session(user_id: str, state: ConversationState) -> None:
+def save_session(user_id: StateKeyLike, state: ConversationState) -> None:
     """Persist *state* for *user_id* in the default repository."""
     _default_repo.save(user_id, state)
 
 
-def clear_session(user_id: str) -> None:
+def clear_session(user_id: StateKeyLike) -> None:
     """Remove *user_id*'s state from the default repository."""
     _default_repo.clear(user_id)
 
 
 def update_session(
-    user_id: str,
+    user_id: StateKeyLike,
     *,
     intent: str | None = None,
     summary: str | None = None,

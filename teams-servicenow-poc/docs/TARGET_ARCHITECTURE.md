@@ -24,7 +24,9 @@ FastAPI (app/main.py)
         │
         ├─► Conversation State Machine (app/state.py)  ← BL-002
         │           │
-        │           └─ ConversationState / InMemoryStateRepository
+        │           └─ ConversationState / StateRepository (StateKey)
+        │                      │
+        │                      └─ [DEMO-01] SqliteStateRepository (app/state_store.py)
         │
         ├─► [BL-006] Incident Collection (app/incident_collection.py)
         │
@@ -115,11 +117,12 @@ prevents contradictory state combinations.
 
 | Class | Role |
 |---|---|
-| `StateRepository` | Abstract base class — persistence contract |
-| `InMemoryStateRepository` | POC implementation (dict-backed, no network) |
+| `StateRepository` | Abstract base class — persistence contract, keyed by `StateKey` |
+| `InMemoryStateRepository` | Tests / local development (dict-backed, not persistent) |
+| `SqliteStateRepository` | DEMO-01 persistent implementation (`app/state_store.py`) |
 
-A future Redis or PostgreSQL implementation replaces only
-`InMemoryStateRepository` without touching any other module.
+A future Redis or PostgreSQL implementation replaces only the repository
+without touching any other module. See **DEMO-01** below.
 
 ### Purity guarantee
 
@@ -777,6 +780,119 @@ Teams ─► API (on_message)          request_started … request_completed / r
   share correlation ids but are separate channels.
 - **Destination.** Standard Python logging only. There is no OpenTelemetry,
   Application Insights, SIEM or persistence.
+
+---
+
+## DEMO-01 — Persistent Conversation State
+
+`app/state_store.py` adds `SqliteStateRepository`, a persistent
+implementation of the unchanged BL-002 `StateRepository` interface. Multi-turn
+conversations (collection → confirmation → execution) now survive process
+restarts. It uses a local SQLite file (Python standard library) and needs no
+external service.
+
+```
+Teams (Bot Framework activity)
+   │
+   ▼
+Conversation Manager (app/main.py on_message)
+   │  StateKey = tenant (channel data) + user (AAD object id) + conversation id
+   ▼
+Persistent State Repository (StateRepository → SqliteStateRepository)
+   │  get → copy of stored ConversationState   save → allowlisted fields only
+   ▼
+AI / Tool orchestration — router, LLM classifier, BL-006/009 collection,
+BL-003 confirmation, BL-004 authorization, BL-005 Tool Gateway
+(BL-010 audit and BL-011 observability observe every step)
+```
+
+- **Isolation.** `StateKey(tenant_id, user_id, conversation_id)` is the
+  primary key, with one column per part. A message from another tenant, user
+  or Teams conversation addresses a different record. It can never read,
+  confirm or cancel this conversation's pending action. A message with no
+  tenant has its own empty-tenant scope (and authorization still denies it).
+  `StateKey`'s repr shows only short hashes. The tenant comes from the same
+  channel data authorization uses, and the user from the same AAD object id
+  as before.
+- **Selection.** The FastAPI lifespan calls
+  `configure_state_repository(create_state_repository())` before Teams
+  initialisation. `STATE_STORE=sqlite` is the default; `STATE_DB_PATH`
+  overrides the file (default `data/conversation_state.db`, git-ignored). The
+  file is created owner-only (0600, directory 0700) in WAL mode.
+  `STATE_STORE=memory` must be set explicitly and logs that state is not
+  persistent. An unknown store or an unopenable database stops startup. There
+  is **no silent fallback** to in-memory state.
+- **Copy semantics.** `get` returns a copy; changes are stored only by
+  `save`. Every handler mutation is already followed by `save_session`, and
+  `EXECUTING` is saved before the Tool Gateway is called (BL-007 duplicate
+  protection holds across restarts).
+- **Failure policy.** Storage errors raise `StatePersistenceError`, whose
+  message is fixed text naming only the operation. The handler catches it,
+  records `request_failed` (`state_persistence_error`) and replies with a
+  controlled message. A failed load stops before routing, the LLM,
+  authorization or the gateway. A failed save stops the request at that
+  point. In particular, a failed `EXECUTING` save means the tool is never
+  called. Authorization and confirmation cannot be bypassed. After a
+  ServiceNow call, the `*_COMPLETED` / `*_FAILED` audit event is emitted
+  **before** the state is saved, so a failed save can never lose the audit
+  record of a write that already happened.
+- **Corrupted records.** An undecodable record, an unknown schema version or
+  phase, or `READY_FOR_CONFIRMATION`/`EXECUTING` without a pending action,
+  loads as a fresh `IDLE` state. This is logged with no content and no raw
+  ids, and the next save overwrites it. `IDLE` has no pending action, so this
+  can never skip confirmation. Values are re-filtered through the same
+  allowlist on load.
+- **Unchanged.** State-machine transition rules, BL-003 confirmation, BL-004
+  authorization, BL-005 gateway boundaries and the create/status/update
+  business flows. BL-010 audit and BL-011 observability read the same
+  session, now addressed by `StateKey`. An operation's audit correlation id
+  is persisted, so it survives restarts.
+
+### What is persisted
+
+| Field | Rule |
+|---|---|
+| `phase` | a `ConversationPhase` value |
+| `pending_action` | `create_incident` / `update_incident` only |
+| `intent` | known intents only (else dropped) |
+| `collected_details` | create: `short_description`, `description`, `impact`, `urgency` (strings). Update: `changes` / `current` (same fields) and `requested` (field names). Every other key is dropped. Kept **only while the operation is in progress** (COLLECTING → EXECUTING); a `COMPLETED` or `FAILED` record stores `{}`, and such details are ignored on load. |
+| `incident_number` | `INC` + 7–10 digits only |
+| `correlation_id` | plain identifier only (BL-010) |
+| `last_error` | the gateway's fixed safe message, ≤ 500 chars |
+| `created_at` / `updated_at` | UTC, maintained by the repository |
+
+### What is intentionally NOT persisted
+
+- `summary`: the LLM classifier's output. No prompts or completions are ever
+  stored.
+- Raw user messages are not stored as such. The incident `short_description`
+  and `description` are, however, taken from what the user typed. For a
+  create request given in one message, they are close to that message's text.
+  They are needed to carry collection across messages (and restarts) up to
+  confirmation, and are dropped once the operation completes or fails.
+- Access or OAuth tokens, API keys, passwords, secrets and `Authorization`
+  headers. None of them are part of `ConversationState`, and serialization is
+  an allowlist.
+- ServiceNow response bodies, work notes and `sys_id`s. Only the current
+  values of the four updateable fields are kept for an update summary.
+- Display names, e-mail addresses and the conversation id in clear. The
+  conversation id is stored as a SHA-256 digest.
+
+The persistence layer has no AI dependency. The LLM never sees or queries it,
+and all SQL is fixed and parameterised.
+
+### Limitations (POC)
+
+- Single process. Concurrent-message protection (`EXECUTING` check) relies on
+  one event loop. Multiple workers would need compare-and-set on save.
+- No expiry. A conversation left in `EXECUTING` by a crash mid-call stays
+  there until cleared, because the transition table has no
+  `EXECUTING → IDLE` path.
+- Collected `short_description` / `description` text is stored as the user
+  typed it while the operation is in progress. If a user types a secret into
+  it, the secret is on disk until the operation completes, fails or is
+  cancelled, and it is sent to ServiceNow on confirmation. A conversation
+  abandoned mid-collection keeps its details, because there is no expiry.
 
 ---
 

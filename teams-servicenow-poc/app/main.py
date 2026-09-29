@@ -65,10 +65,14 @@ from app.tools import (
 )
 from app.state import (
     ConversationPhase,
+    StateKey,
+    StatePersistenceError,
+    configure_state_repository,
     get_session,
     save_session,
     update_session,
 )
+from app.state_store import create_state_repository
 
 
 load_dotenv()
@@ -199,6 +203,21 @@ def _teams_user_id(activity) -> str:
     )
 
 
+def _state_key(activity) -> StateKey:
+    """
+    DEMO-01: conversation state is isolated per tenant + user + conversation.
+    Uses the same tenant source as authorization and the same user id as
+    BL-001..BL-011 session handling.
+    """
+    conversation_id = getattr(getattr(activity, "conversation", None), "id", None)
+    tenant_id = _channel_tenant_id(activity)
+    return StateKey(
+        tenant_id=tenant_id if isinstance(tenant_id, str) else "",
+        user_id=_teams_user_id(activity),
+        conversation_id=conversation_id if isinstance(conversation_id, str) else "",
+    )
+
+
 _ACTIVE_PHASES = (
     ConversationPhase.COLLECTING,
     ConversationPhase.READY_FOR_CONFIRMATION,
@@ -219,7 +238,7 @@ def _observation_start(context, request_id: str):
         user = obs.user_ref(identity.user_id, identity.tenant_id)
         if not (activity.text or "").strip():
             return request_id, user, None
-        session = get_session(_teams_user_id(activity))
+        session = get_session(_state_key(activity))
         if session.phase in _ACTIVE_PHASES and safe_ref(session.correlation_id):
             return session.correlation_id, user, session.phase.value
         return request_id, user, session.phase.value
@@ -231,7 +250,7 @@ def _observation_phase(context):
     try:
         if not (context.activity.text or "").strip():
             return None
-        return get_session(_teams_user_id(context.activity)).phase.value
+        return get_session(_state_key(context.activity)).phase.value
     except Exception:  # noqa: BLE001
         return None
 
@@ -275,10 +294,12 @@ async def _handle_message(context):
     try:
 
         # ----------------------------------------------------
-        # Get existing conversation state
+        # Get existing conversation state (DEMO-01: keyed by
+        # tenant + user + conversation)
         # ----------------------------------------------------
 
-        session = get_session(user_id)
+        state_key = _state_key(context.activity)
+        session = get_session(state_key)
 
 
         # ----------------------------------------------------
@@ -295,7 +316,7 @@ async def _handle_message(context):
                 collection = process_update_message(session, user_message)
             else:
                 collection = process_collection_message(session, user_message)
-            save_session(user_id, session)
+            save_session(state_key, session)
 
             if session.phase is ConversationPhase.READY_FOR_CONFIRMATION:
                 _audit_session(AuditEventType.CONFIRMATION_REQUESTED, context, session)
@@ -343,7 +364,7 @@ async def _handle_message(context):
                 # Transition to CANCELLED, then reset to IDLE.
                 session.transition_to(ConversationPhase.CANCELLED)
                 session.transition_to(ConversationPhase.IDLE)
-                save_session(user_id, session)
+                save_session(state_key, session)
 
                 await context.send(
                     "❌ Cancelled. No action has been taken.\n\n"
@@ -439,7 +460,7 @@ async def _handle_message(context):
         # ----------------------------------------------------
 
         update_session(
-            user_id,
+            state_key,
             intent=intent,
             summary=summary,
         )
@@ -472,7 +493,7 @@ async def _handle_message(context):
             # BL-006: start deterministic incident collection.  Details the
             # user already gave are captured from their own message; the
             # LLM summary is never used as an incident field value.
-            session = get_session(user_id)
+            session = get_session(state_key)
 
             if session.phase in (
                 ConversationPhase.IDLE,
@@ -482,7 +503,7 @@ async def _handle_message(context):
             ):
                 collection = start_incident_collection(session, user_message)
                 session.correlation_id = _audit_request_id()
-                save_session(user_id, session)
+                save_session(state_key, session)
 
                 _audit_session(AuditEventType.INCIDENT_CREATE_REQUESTED, context, session)
                 if collection.ready:
@@ -541,6 +562,17 @@ async def _handle_message(context):
         await context.send(response)
 
 
+    except StatePersistenceError as exc:
+
+        # DEMO-01: fail safe.  Nothing after the failed load/save ran, and
+        # there is no fallback store.
+        obs.mark_request_failed("state_persistence_error")
+        logger.error("conversation state %s failed; request stopped", exc.operation)
+
+        await context.send(
+            _STATE_UNAVAILABLE if exc.operation == "load" else _STATE_NOT_SAVED
+        )
+
     except Exception as exc:
 
         obs.mark_request_failed("handler_exception")
@@ -554,6 +586,18 @@ async def _handle_message(context):
             "I'm having trouble understanding your request right now. "
             "Please try again."
         )
+
+
+_STATE_UNAVAILABLE = (
+    "⚠️ I can't access your conversation right now, so no action has been "
+    "taken. Please try again in a moment."
+)
+
+_STATE_NOT_SAVED = (
+    "⚠️ I couldn't save the progress of this conversation, so I've stopped "
+    "here. If you were creating or updating an incident, please check its "
+    "status before trying again."
+)
 
 
 # ============================================================
@@ -666,7 +710,7 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
         )
         session.transition_to(ConversationPhase.CANCELLED)
         session.transition_to(ConversationPhase.IDLE)
-        save_session(user_id, session)
+        save_session(_state_key(context.activity), session)
 
         await context.send(
             "⚠️ Some incident details are missing or invalid, so no incident "
@@ -709,7 +753,7 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
 
     # -- EXECUTING is persisted BEFORE the side effect ---------------------
     session.transition_to(ConversationPhase.EXECUTING)
-    save_session(user_id, session)
+    save_session(_state_key(context.activity), session)
 
     # -- BL-005: single gateway call — CREATE is never retried ------------
     try:
@@ -735,13 +779,15 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
     if tool_result.success:
         session.incident_number = tool_result.incident_number or None
         session.transition_to(ConversationPhase.COMPLETED)
-        save_session(user_id, session)
+        # DEMO-01: audit first, so a failed save can never lose the record
+        # of a ServiceNow write that already happened.
         _audit(
             AuditEventType.INCIDENT_CREATE_COMPLETED, context,
             correlation_id=correlation_id, action=AuthorizableAction.CREATE_INCIDENT,
             tool=ServiceNowToolAction.CREATE_INCIDENT.value,
             incident_number=safe_incident_number(session.incident_number),
         )
+        save_session(_state_key(context.activity), session)
 
         if session.incident_number:
             await context.send(
@@ -760,13 +806,15 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
 
     session.last_error = tool_result.safe_message
     session.transition_to(ConversationPhase.FAILED)
-    save_session(user_id, session)
+    # DEMO-01: audit first, so a failed save can never lose the record of
+    # the outcome.
     _audit(
         AuditEventType.INCIDENT_CREATE_FAILED, context,
         correlation_id=correlation_id, action=AuthorizableAction.CREATE_INCIDENT,
         tool=ServiceNowToolAction.CREATE_INCIDENT.value,
         reason=_failure_reason(tool_result),
     )
+    save_session(_state_key(context.activity), session)
 
     await context.send(
         f"❌ The incident could not be created: {tool_result.safe_message}\n\n"
@@ -943,7 +991,7 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
 
     # The read above awaited, so another message may have changed this
     # user's conversation meanwhile.  Fail closed: never overwrite it.
-    session = get_session(user_id)
+    session = get_session(_state_key(context.activity))
     if session.phase not in (
         ConversationPhase.IDLE,
         ConversationPhase.COMPLETED,
@@ -965,7 +1013,7 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
         session, command, current_values(read_result.incident)
     )
     session.correlation_id = correlation_id
-    save_session(user_id, session)
+    save_session(_state_key(context.activity), session)
     if result.ready:
         _audit_session(AuditEventType.CONFIRMATION_REQUESTED, context, session)
     return result.reply
@@ -1008,7 +1056,7 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
         )
         session.transition_to(ConversationPhase.CANCELLED)
         session.transition_to(ConversationPhase.IDLE)
-        save_session(user_id, session)
+        save_session(_state_key(context.activity), session)
         await context.send(
             "⚠️ Some update details are missing or invalid, so the incident "
             "was not changed.\n\n"
@@ -1043,7 +1091,7 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
 
     # -- EXECUTING is persisted BEFORE the side effect ---------------------
     session.transition_to(ConversationPhase.EXECUTING)
-    save_session(user_id, session)
+    save_session(_state_key(context.activity), session)
 
     # -- Single gateway call — UPDATE is never retried ---------------------
     try:
@@ -1068,8 +1116,10 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
 
     if tool_result.success:
         session.transition_to(ConversationPhase.COMPLETED)
-        save_session(user_id, session)
+        # DEMO-01: audit first, so a failed save can never lose the record
+        # of a ServiceNow write that already happened.
         _audit(AuditEventType.INCIDENT_UPDATE_COMPLETED, context, **upd)
+        save_session(_state_key(context.activity), session)
 
         if tool_result.incident:
             await context.send(
@@ -1087,11 +1137,13 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
 
     session.last_error = tool_result.safe_message
     session.transition_to(ConversationPhase.FAILED)
-    save_session(user_id, session)
+    # DEMO-01: audit first, so a failed save can never lose the record of
+    # the outcome.
     _audit(
         AuditEventType.INCIDENT_UPDATE_FAILED, context,
         reason=_failure_reason(tool_result), **upd,
     )
+    save_session(_state_key(context.activity), session)
 
     await context.send(
         f"❌ The update to {number} could not be applied: "
@@ -1106,6 +1158,11 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
 
 @asynccontextmanager
 async def lifespan(app):
+
+    # DEMO-01: select the conversation state store before accepting
+    # messages.  A store that cannot be opened stops startup — there is no
+    # silent fallback to non-persistent state.
+    configure_state_repository(create_state_repository())
 
     await teams_app.initialize()
 

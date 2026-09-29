@@ -64,8 +64,12 @@ from app.servicenow import (  # noqa: E402
 from app.state import (  # noqa: E402
     ConversationPhase,
     ConversationState,
+    InMemoryStateRepository,
+    StateKey,
     clear_session,
+    configure_state_repository,
     get_session,
+    get_state_repository,
     save_session,
 )
 from app.tools.servicenow import (  # noqa: E402
@@ -79,6 +83,8 @@ from app.tools.servicenow import (  # noqa: E402
 TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 OTHER_TENANT = "00000000-0000-0000-0000-000000000000"
 USER = "bl009-user-aad-oid"
+# DEMO-01: the conversation-state key app.main derives from _context().
+STATE_KEY = StateKey(TENANT, USER)
 
 AGENT = UserIdentity(
     user_id=USER, tenant_id=TENANT, display_name="Bob", email=None,
@@ -334,8 +340,13 @@ class _Base(unittest.IsolatedAsyncioTestCase):
     authorize_fn = staticmethod(agent_authorize)
 
     async def asyncSetUp(self):
-        clear_session(USER)
-        self.addCleanup(clear_session, USER)
+        # DEMO-01: state is keyed by tenant + user + conversation, so each
+        # test starts from an empty store (no state leaks between tests).
+        previous_repo = get_state_repository()
+        configure_state_repository(InMemoryStateRepository())
+        self.addCleanup(configure_state_repository, previous_repo)
+        clear_session(STATE_KEY)
+        self.addCleanup(clear_session, STATE_KEY)
 
         self.client = AsyncMock()
         self.client.get_incident.return_value = dict(CURRENT)
@@ -370,7 +381,7 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
     async def _ready(self, command="Update INC0010002 impact to 1 and urgency to 2") -> str:
         reply = await self._send(command)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
         return reply
 
 
@@ -397,7 +408,7 @@ class TestCurrentValues(_Base):
         reply = await self._ready("update INC0010002 description to New text")
         self.assertIn("**Description:** (current value not available) → New text", reply)
         self.client.get_incident.return_value = {"number": "INC0010002", "impact": "2"}
-        clear_session(USER)
+        clear_session(STATE_KEY)
         reply = await self._ready("update INC0010002 urgency to 1")
         self.assertIn("**Urgency:** (current value not available) → 1", reply)
 
@@ -407,7 +418,7 @@ class TestCurrentValues(_Base):
         )
         reply = await self._send("Update INC0010002 impact to 1")
         self.assertEqual(reply, "I couldn't find incident INC0010002.")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
         self.client.update_incident.assert_not_called()
 
     async def test_21_retrieval_failure_prevents_update(self):
@@ -416,7 +427,7 @@ class TestCurrentValues(_Base):
         self.assertIn("couldn't retrieve incident INC0010002", reply)
         self.assertNotIn("→", reply)
         self.assertNotIn("SECRET", reply)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
         await self._send("yes")
         self.client.update_incident.assert_not_called()
 
@@ -425,7 +436,7 @@ class TestCurrentValues(_Base):
                           AsyncMock(side_effect=RuntimeError("password=hunter2"))):
             reply = await self._send("Update INC0010002 impact to 1")
         self.assertNotIn("hunter2", reply)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
         self.client.update_incident.assert_not_called()
 
 
@@ -440,19 +451,19 @@ class TestConfirmation(_Base):
         self.assertIn("You're asking me to update **INC0010002**", reply)
         self.assertIn("Shall I apply these changes?", reply)
         self.client.update_incident.assert_not_called()
-        self.assertEqual(get_session(USER).pending_action, "update_incident")
+        self.assertEqual(get_session(STATE_KEY).pending_action, "update_incident")
 
     async def test_23_explicit_confirmation_proceeds(self):
         for phrase in ("yes", "confirm", "go ahead", "proceed", "approved", "  YES "):
             with self.subTest(phrase=phrase):
-                clear_session(USER)
+                clear_session(STATE_KEY)
                 self.client.update_incident.reset_mock()
                 await self._ready()
                 await self._send(phrase)
                 self.client.update_incident.assert_awaited_once_with(
                     incident_number="INC0010002", fields={"impact": "1", "urgency": "2"}
                 )
-                self.assertEqual(get_session(USER).phase, ConversationPhase.COMPLETED)
+                self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.COMPLETED)
 
     async def test_24_ambiguous_confirmation_does_not_proceed(self):
         await self._ready()
@@ -461,7 +472,7 @@ class TestConfirmation(_Base):
             with self.subTest(phrase=phrase):
                 reply = await self._send(phrase)
                 self.assertIn("explicit confirmation", reply)
-                self.assertEqual(get_session(USER).phase,
+                self.assertEqual(get_session(STATE_KEY).phase,
                                  ConversationPhase.READY_FOR_CONFIRMATION)
         self.client.update_incident.assert_not_called()
         self.classify.assert_not_called()
@@ -469,11 +480,11 @@ class TestConfirmation(_Base):
     async def test_25_cancellation_does_not_execute(self):
         for phrase in ("cancel", "no", "stop", "abort", "never mind"):
             with self.subTest(phrase=phrase):
-                clear_session(USER)
+                clear_session(STATE_KEY)
                 await self._ready()
                 reply = await self._send(phrase)
                 self.assertIn("Cancelled", reply)
-                session = get_session(USER)
+                session = get_session(STATE_KEY)
                 self.assertEqual(session.phase, ConversationPhase.IDLE)
                 self.assertIsNone(session.pending_action)
                 self.assertEqual(session.collected_details, {})
@@ -484,7 +495,7 @@ class TestConfirmation(_Base):
         await self._send("Update INC0010002 impact to 1 and urgency to 2")
         self.client.update_incident.assert_not_called()
         # Confirmation words outside READY_FOR_CONFIRMATION never execute.
-        clear_session(USER)
+        clear_session(STATE_KEY)
         for phrase in ("yes", "confirm", "go ahead"):
             await self._send(phrase)
         # The LLM cannot trigger an update (no update intent exists).
@@ -493,7 +504,7 @@ class TestConfirmation(_Base):
             "incident_number": "INC0010002", "fields": {"impact": "1"},
         }
         await self._send("please bump the impact on my ticket to 1")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
         self.client.update_incident.assert_not_called()
         # A pending update without executable data is refused, not executed.
         state = ConversationState(
@@ -501,7 +512,7 @@ class TestConfirmation(_Base):
             pending_action="update_incident", incident_number="INC0010002",
             collected_details={"changes": {"priority": "1"}},
         )
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         reply = await self._send("yes")
         self.assertIn("missing or invalid", reply)
         self.client.update_incident.assert_not_called()
@@ -546,7 +557,7 @@ class TestAuthorization(_Base):
         reply = await self._send("yes")
         self.assertIn("not authorised", reply)
         self.client.update_incident.assert_not_called()
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
 
 
 class TestDefaultPolicyDenies(_Base):
@@ -557,7 +568,7 @@ class TestDefaultPolicyDenies(_Base):
     async def test_28_unauthorized_user_cannot_execute(self):
         reply = await self._send("Update INC0010002 impact to 1")
         self.assertIn("not authorised", reply)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
         self.client.get_incident.assert_not_called()
         self.client.update_incident.assert_not_called()
 
@@ -672,7 +683,7 @@ class TestExecutionSafety(_Base):
         self.client.update_incident.return_value = dict(UPDATED, priority="3", urgency="3")
         await self._ready()
         reply = await self._send("yes")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COMPLETED)
         self.assertEqual(session.incident_number, "INC0010002")
         self.assertIn("ServiceNow confirmed the update", reply)
@@ -698,7 +709,7 @@ class TestExecutionSafety(_Base):
         seen = {}
 
         async def update(**kwargs):
-            seen["phase"] = get_session(USER).phase
+            seen["phase"] = get_session(STATE_KEY).phase
             return dict(UPDATED)
 
         self.client.update_incident.side_effect = update
@@ -712,7 +723,7 @@ class TestExecutionSafety(_Base):
         )
         await self._ready()
         reply = await self._send("yes")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.FAILED)
         self.assertIn("could not be applied", reply)
         for leaked in ("SECRET", "Bearer", "HTTP 500", "https://", "✅"):
@@ -723,7 +734,7 @@ class TestExecutionSafety(_Base):
         with patch.object(self.gateway, "execute",
                           AsyncMock(side_effect=RuntimeError("password=hunter2"))):
             reply = await self._send("yes")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
         self.assertNotIn("hunter2", reply)
         self.assertNotIn("✅", reply)
 
@@ -734,7 +745,7 @@ class TestExecutionSafety(_Base):
         await self._send("yes")
         await self._send("confirm")
         self.assertEqual(self.client.update_incident.await_count, 1)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
 
     async def test_42_duplicate_confirmation_cannot_execute_twice(self):
         await self._ready()
@@ -754,7 +765,7 @@ class TestExecutionSafety(_Base):
         first_ctx, second_ctx = _context("yes"), _context("yes")
         first = asyncio.create_task(main.on_message(first_ctx))
         for _ in range(1000):
-            if get_session(USER).phase is ConversationPhase.EXECUTING:
+            if get_session(STATE_KEY).phase is ConversationPhase.EXECUTING:
                 break
             await asyncio.sleep(0)
         else:
@@ -774,13 +785,13 @@ class TestExecutionSafety(_Base):
         self.assertIn("did not return the updated values", reply)
         self.assertNotIn("**Impact:**", reply)
         # Validation failure inside the gateway is a failure, not success.
-        clear_session(USER)
+        clear_session(STATE_KEY)
         await self._ready()
         with patch.object(main, "UpdateIncidentToolRequest",
                           side_effect=lambda **kw: UpdateIncidentToolRequest(
                               **{**kw, "impact": "9"})):
             reply = await self._send("yes")
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
         self.assertNotIn("✅", reply)
 
 
@@ -793,7 +804,7 @@ class TestRegression(_Base):
     async def test_45_incident_creation_still_works(self):
         state = ConversationState()
         start_incident_collection(state, "VPN is down for me. Impact is 2 and urgency is 1.")
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         reply = await self._send("yes")
         self.assertIn("INC0012345", reply)
         self.client.create_incident.assert_awaited_once()
@@ -803,7 +814,7 @@ class TestRegression(_Base):
         reply = await self._send("status of INC0010002")
         self.assertIn("VPN unavailable", reply)
         self.assertNotIn("Shall I", reply)
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.IDLE)
         self.client.update_incident.assert_not_called()
 
@@ -813,14 +824,14 @@ class TestRegression(_Base):
         reply = await self._send("INC0010003")
         self.assertIn("didn't recognise", reply)
         self.client.get_incident.assert_not_called()
-        self.assertEqual(get_session(USER).incident_number, "INC0010002")
+        self.assertEqual(get_session(STATE_KEY).incident_number, "INC0010002")
 
     async def test_update_command_during_create_collection_is_collection_input(self):
         state = ConversationState()
         start_incident_collection(state, "I need to report an issue")
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         await self._send("update INC0010002 impact to 1")
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COLLECTING)
         self.assertEqual(session.pending_action, "create_incident")
         self.client.get_incident.assert_not_called()
@@ -880,7 +891,7 @@ class TestStateChangeRace(_Base):
         self.assertEqual(sum(r == main._REQUEST_IN_PROGRESS for r in replies), 1)
         self.assertFalse(any("trouble understanding" in r for r in replies))
 
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.READY_FOR_CONFIRMATION)
         shown = replies[0] if "You're asking" in replies[0] else replies[1]
         pending = session.collected_details["changes"]
@@ -897,12 +908,12 @@ class TestStateChangeRace(_Base):
     async def test_49_other_flow_started_during_read_is_not_overwritten(self):
         ctx, task, release = await self._start_and_hold("Update INC0010002 impact to 1")
         # Meanwhile the user starts a create; that conversation must survive.
-        start_incident_collection(get_session(USER), "I need to report an issue")
+        start_incident_collection(get_session(STATE_KEY), "I need to report an issue")
         release.set()
         await task
 
         self.assertEqual(ctx.send.await_args.args[0], main._REQUEST_IN_PROGRESS)
-        session = get_session(USER)
+        session = get_session(STATE_KEY)
         self.assertEqual(session.phase, ConversationPhase.COLLECTING)
         self.assertEqual(session.pending_action, "create_incident")
         self.assertNotIn("changes", session.collected_details)

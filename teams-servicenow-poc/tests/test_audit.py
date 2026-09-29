@@ -57,8 +57,12 @@ from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
 from app.state import (  # noqa: E402
     ConversationPhase,
     ConversationState,
+    InMemoryStateRepository,
+    StateKey,
     clear_session,
+    configure_state_repository,
     get_session,
+    get_state_repository,
     save_session,
 )
 from app.tools.servicenow import (  # noqa: E402
@@ -73,6 +77,8 @@ E = AuditEventType
 TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 OTHER_TENANT = "00000000-0000-0000-0000-000000000000"
 USER = "11111111-2222-3333-4444-555555555555"
+# DEMO-01: the conversation-state key app.main derives from _context().
+STATE_KEY = StateKey(TENANT, USER, "19:conv-abc")
 
 # Secret / sensitive markers that must never appear in an audit record.
 PASSWORD = "ABC123-PASSWORD"
@@ -271,8 +277,13 @@ class _Base(unittest.IsolatedAsyncioTestCase):
     audit_fails = False
 
     async def asyncSetUp(self):
-        clear_session(USER)
-        self.addCleanup(clear_session, USER)
+        # DEMO-01: state is keyed by tenant + user + conversation, so each
+        # test starts from an empty store (no state leaks between tests).
+        previous_repo = get_state_repository()
+        configure_state_repository(InMemoryStateRepository())
+        self.addCleanup(configure_state_repository, previous_repo)
+        clear_session(STATE_KEY)
+        self.addCleanup(clear_session, STATE_KEY)
         self.timeline = []
         self.audit = CaptureAudit(self.timeline, fail=self.audit_fails)
 
@@ -321,7 +332,7 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         start_incident_collection(
             state, f"{description}. Impact is 2 and urgency is 1.")
         state.correlation_id = "op-create-1"
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
 
     def _assert_clean(self, extra=()):
         blob = self.audit.blob()
@@ -451,7 +462,10 @@ class TestAuthorizationAuditing(_Base):
 
     async def test_20_denied_create(self):
         self._ready_create()
-        await self._send("yes", tenant=OTHER_TENANT)
+        # DEMO-01: a message from another tenant addresses different state, so
+        # deny in this conversation by configuring a different allowed tenant.
+        with patch.dict("os.environ", {"TEAMS_TENANT_ID": OTHER_TENANT}):
+            await self._send("yes")
         self.assertEqual(len(self.audit.of(E.INCIDENT_CREATE_DENIED)), 1)
         self.assertEqual(self.audit.of(E.INCIDENT_CREATE_COMPLETED), [])
         self.client.create_incident.assert_not_called()
@@ -648,7 +662,7 @@ class TestRegression(_Base):
         reply = await self._send("INC0010002")
         self.assertIn("VPN unavailable", reply)
         self.assertEqual(self.audit.of(E.CONFIRMATION_REQUESTED), [])
-        self.assertEqual(get_session(USER).phase, ConversationPhase.IDLE)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.IDLE)
 
     async def test_43_writes_still_require_confirmation(self):
         await self._send("VPN is down. Impact is 2 and urgency is 1.")
@@ -656,7 +670,7 @@ class TestRegression(_Base):
         await self._send("okay")
         self.client.create_incident.assert_not_called()
         self.client.update_incident.assert_not_called()
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
 
     async def test_44_gateway_restrictions_unchanged(self):
         identity = UserIdentity(USER, TENANT, None, None, IdentitySource.AAD_OBJECT_ID)
@@ -685,7 +699,7 @@ class TestAuditFailure(_Base):
             incident_number="INC0010002",
             collected_details={"changes": {"impact": "1"}, "requested": [], "current": {}},
         )
-        save_session(USER, state)
+        save_session(STATE_KEY, state)
         reply = await self._send("yes")
         self.assertIn("not authorised", reply)
         self.client.update_incident.assert_not_called()
@@ -696,7 +710,7 @@ class TestAuditFailure(_Base):
         await self._send("Update INC0010002 impact to 1")
         reply = await self._send("yes")
         self.assertNotIn("✅", reply)
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
 
     async def test_operations_unchanged_when_audit_fails(self):
         self.assertIn("VPN unavailable", await self._send("INC0010002"))
@@ -730,8 +744,8 @@ class TestCorrelation(_Base):
                          ["act-5"])
         self.assertEqual(self.audit.types()[0], E.INCIDENT_CREATE_REQUESTED)
         self.assertEqual(self.audit.types()[-1], E.INCIDENT_CREATE_COMPLETED)
-        self.assertIsNone(get_session(USER).correlation_id if
-                          get_session(USER).phase is ConversationPhase.IDLE else None)
+        self.assertIsNone(get_session(STATE_KEY).correlation_id if
+                          get_session(STATE_KEY).phase is ConversationPhase.IDLE else None)
 
     async def test_unsafe_activity_id_replaced_by_uuid(self):
         await self._send("INC0010002", activity_id="evil id <script>")
@@ -748,7 +762,7 @@ class TestCorrelation(_Base):
     async def test_correlation_cleared_when_operation_ends(self):
         self._ready_create()
         await self._send("cancel")
-        self.assertIsNone(get_session(USER).correlation_id)
+        self.assertIsNone(get_session(STATE_KEY).correlation_id)
 
 
 if __name__ == "__main__":

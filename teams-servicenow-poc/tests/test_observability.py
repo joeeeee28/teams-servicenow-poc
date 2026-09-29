@@ -55,9 +55,13 @@ from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
 from app.state import (  # noqa: E402
     ConversationPhase,
     ConversationState,
+    InMemoryStateRepository,
     InvalidTransitionError,
+    StateKey,
     clear_session,
+    configure_state_repository,
     get_session,
+    get_state_repository,
     save_session,
 )
 from app.tools.servicenow import (  # noqa: E402
@@ -71,6 +75,8 @@ N, C, O = ObsEventName, ObsComponent, ObsOutcome
 TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 OTHER_TENANT = "00000000-0000-0000-0000-000000000000"
 USER = "11111111-2222-3333-4444-555555555555"
+# DEMO-01: the conversation-state key app.main derives from _context().
+STATE_KEY = StateKey(TENANT, USER, "19:conv-abc")
 
 PASSWORD = "ABC123-PASSWORD"
 OAUTH_TOKEN = "OAUTH-TOKEN-XYZ987"
@@ -291,8 +297,13 @@ class _Base(unittest.IsolatedAsyncioTestCase):
     authorize_fn = staticmethod(agent_authorize)
 
     async def asyncSetUp(self):
-        clear_session(USER)
-        self.addCleanup(clear_session, USER)
+        # DEMO-01: state is keyed by tenant + user + conversation, so each
+        # test starts from an empty store (no state leaks between tests).
+        previous_repo = get_state_repository()
+        configure_state_repository(InMemoryStateRepository())
+        self.addCleanup(configure_state_repository, previous_repo)
+        clear_session(STATE_KEY)
+        self.addCleanup(clear_session, STATE_KEY)
         self.timeline = []
         self.capture = CaptureObs(self.timeline, fail=self.obs_fails)
         self.client = AsyncMock()
@@ -339,7 +350,7 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         s = ConversationState()
         start_incident_collection(s, f"{description}. Impact is 2 and urgency is 1.")
         s.correlation_id = "op-create-1"
-        save_session(USER, s)
+        save_session(STATE_KEY, s)
         # Setup transitions happen outside any request; observe only what follows.
         self.capture.events.clear()
         self.timeline.clear()
@@ -425,7 +436,7 @@ class TestRequestLifecycle(_Base):
         self._ready_create()
         await self._send("yes", activity_id="act-confirm")
         self.assertEqual({e.correlation_id for e in self.capture.events}, {"op-create-1"})
-        self.assertEqual(get_session(USER).phase, ConversationPhase.COMPLETED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.COMPLETED)
         self.capture.events.clear()
         await self._send("INC0010002", activity_id="act-next")
         self.assertEqual({e.correlation_id for e in self.capture.events}, {"act-next"})
@@ -433,7 +444,7 @@ class TestRequestLifecycle(_Base):
     async def test_correlation_resets_after_cancel(self):
         self._ready_create()
         await self._send("cancel", activity_id="act-cancel")
-        self.assertIsNone(get_session(USER).correlation_id)
+        self.assertIsNone(get_session(STATE_KEY).correlation_id)
         self.capture.events.clear()
         await self._send("hello", activity_id="act-after")
         self.assertEqual({e.correlation_id for e in self.capture.events}, {"act-after"})
@@ -652,7 +663,7 @@ class TestObservabilityFailure(_Base):
         self.assertIn("VPN", await self._send("INC0010002"))
         self._ready_create()
         self.assertIn("INC0012345", await self._send("yes"))
-        self.assertEqual(get_session(USER).phase, ConversationPhase.COMPLETED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.COMPLETED)
         self.assertEqual(self.capture.events, [])
 
     async def test_authorization_still_enforced(self):
@@ -669,7 +680,7 @@ class TestObservabilityFailure(_Base):
         reply = await self._send("sounds good")
         self.assertIn("explicit confirmation", reply)
         self.client.create_incident.assert_not_called()
-        self.assertEqual(get_session(USER).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
 
     async def test_failures_stay_failures_and_no_internal_error_exposed(self):
         self.client.create_incident.side_effect = ServiceNowError("boom")
@@ -677,7 +688,7 @@ class TestObservabilityFailure(_Base):
         reply = await self._send("yes")
         self.assertNotIn("✅", reply)
         self.assertNotIn("observability", reply.lower())
-        self.assertEqual(get_session(USER).phase, ConversationPhase.FAILED)
+        self.assertEqual(get_session(STATE_KEY).phase, ConversationPhase.FAILED)
 
     async def test_audit_trail_unaffected(self):
         audit = MagicMock()
