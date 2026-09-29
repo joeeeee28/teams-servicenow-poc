@@ -518,9 +518,14 @@ class TestNoRetryNoDuplicates(_Base):
         self._ready()
         first_ctx, second_ctx = _context("yes"), _context("yes")
         first = asyncio.create_task(main.on_message(first_ctx))
-        await asyncio.sleep(0)
-        while get_session(USER).phase is not ConversationPhase.EXECUTING:
+        for _ in range(1000):
+            if get_session(USER).phase is ConversationPhase.EXECUTING:
+                break
             await asyncio.sleep(0)
+        else:
+            release.set()
+            await first
+            self.fail("first confirmation never reached EXECUTING")
         await main.on_message(second_ctx)
         release.set()
         await first
