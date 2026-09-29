@@ -159,6 +159,22 @@ class InvalidTransitionError(Exception):
 
 
 # ===========================================================================
+# Passive transition listeners (BL-011 observability)
+# ===========================================================================
+
+# Called as ``listener(previous_phase, new_phase)`` AFTER a successful
+# transition.  Listeners are observers only: they cannot veto or alter a
+# transition, and any exception they raise is swallowed.
+_transition_listeners: list = []
+
+
+def add_transition_listener(listener) -> None:
+    """Register a passive observer of successful phase transitions."""
+    if listener not in _transition_listeners:
+        _transition_listeners.append(listener)
+
+
+# ===========================================================================
 # Conversation state dataclass
 # ===========================================================================
 
@@ -244,7 +260,15 @@ class ConversationState:
             self.last_error = None
             self.correlation_id = None
 
+        previous_phase = self.phase
         self.phase = new_phase
+
+        for listener in tuple(_transition_listeners):
+            try:
+                listener(previous_phase, new_phase)
+            except Exception:  # noqa: BLE001 — observers must never affect state
+                logger.debug("transition listener failed")
+
         return self
 
 

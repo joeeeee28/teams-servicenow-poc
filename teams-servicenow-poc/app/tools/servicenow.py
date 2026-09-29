@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -29,6 +30,7 @@ from app.audit import (
     safe_incident_number,
     safe_ref,
 )
+import app.observability as _obs
 from app.security.authorization import AuthorizableAction, AuthorizationDecision
 from app.security.identity import UserIdentity
 from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
@@ -316,6 +318,15 @@ class ToolResult:
         )
 
 
+def _failure_outcome(error_code: Optional[str]):
+    """BL-011 outcome for a failed tool result."""
+    if error_code == "AUTHORIZATION_DENIED":
+        return _obs.ObsOutcome.DENIED
+    if error_code == "VALIDATION_ERROR":
+        return _obs.ObsOutcome.REJECTED
+    return _obs.ObsOutcome.FAILED
+
+
 # ===========================================================================
 # ServiceNow Tool Gateway
 # ===========================================================================
@@ -356,6 +367,61 @@ class ServiceNowToolGateway:
         return self._client
 
     async def execute(
+        self,
+        identity: UserIdentity,
+        authorization_decision: AuthorizationDecision,
+        tool_action: ServiceNowToolAction,
+        request: Any,
+        *,
+        raise_on_error: bool = False,
+        correlation_id: Optional[str] = None,
+    ) -> ToolResult:
+        """
+        Execute a tool operation (see ``_execute``), observed by BL-011:
+        ``tool_started`` then ``tool_completed`` / ``tool_failed`` with the
+        duration.  Observation is passive — the result (or raised error) is
+        exactly what ``_execute`` produced.
+        """
+        started = time.monotonic()
+        self._observe_tool(_obs.ObsEventName.TOOL_STARTED, _obs.ObsOutcome.STARTED,
+                           identity, tool_action, correlation_id)
+        try:
+            result = await self._execute(
+                identity, authorization_decision, tool_action, request,
+                raise_on_error=raise_on_error, correlation_id=correlation_id,
+            )
+        except ToolGatewayError as err:
+            self._observe_tool(_obs.ObsEventName.TOOL_FAILED, _failure_outcome(err.error_code),
+                               identity, tool_action, correlation_id,
+                               error_code=err.error_code.lower(), duration_ms=_obs.elapsed_ms(started))
+            raise
+        if result.success:
+            self._observe_tool(_obs.ObsEventName.TOOL_COMPLETED, _obs.ObsOutcome.SUCCESS,
+                               identity, tool_action, correlation_id,
+                               duration_ms=_obs.elapsed_ms(started))
+        else:
+            self._observe_tool(_obs.ObsEventName.TOOL_FAILED, _failure_outcome(result.error_code),
+                               identity, tool_action, correlation_id,
+                               error_code=(result.error_code or "execution_error").lower(),
+                               duration_ms=_obs.elapsed_ms(started))
+        return result
+
+    @staticmethod
+    def _observe_tool(event_name, outcome, identity, tool_action, correlation_id, **fields) -> None:
+        known_tool = isinstance(tool_action, ServiceNowToolAction)
+        is_identity = isinstance(identity, UserIdentity)
+        _obs.observability.record(
+            event_name,
+            _obs.ObsComponent.TOOL_GATEWAY,
+            outcome,
+            correlation_id=correlation_id,
+            action=_ACTION_MAPPING.get(tool_action) if known_tool else None,
+            operation=tool_action.value if known_tool else None,
+            user_ref=_obs.user_ref(identity.user_id, identity.tenant_id) if is_identity else None,
+            **fields,
+        )
+
+    async def _execute(
         self,
         identity: UserIdentity,
         authorization_decision: AuthorizationDecision,

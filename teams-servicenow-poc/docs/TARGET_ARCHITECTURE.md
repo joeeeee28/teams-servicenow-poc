@@ -34,7 +34,9 @@ FastAPI (app/main.py)
         │
         ├─► [BL-005] ServiceNow Tool Gateway (app/servicenow.py)
         │
-        └─► [BL-010] Audit logging (app/audit.py) — observation only
+        ├─► [BL-010] Audit logging (app/audit.py) — observation only
+        │
+        └─► [BL-011] Structured observability (app/observability.py) — observation only
 ```
 
 ---
@@ -725,6 +727,56 @@ ServiceNow ────────────────► *_COMPLETED only 
   authorization or confirmation, and cannot turn a failure into a success.
 - **Destination.** Standard Python logging only. There is no database, SIEM
   or cloud sink yet.
+
+---
+
+## BL-011 — Structured Observability
+
+`app/observability.py` emits operational telemetry (request flow, latency,
+outcomes and failures) as JSON lines on the dedicated `app.observability`
+logger. It **observes** each layer and controls none of them:
+
+```
+Teams ─► API (on_message)          request_started … request_completed / request_failed  (duration)
+          ├─ Identity/Security      user_ref = 16-hex SHA-256(tenant:user), never the raw id
+          ├─ Conversation Manager   state_transition        (passive listener on ConversationState)
+          ├─ AI Orchestrator        route_selected           (router: route; ai_classifier: intent, duration)
+          ├─ Policy/Authorization   authorization_decision   (action, stage, duration)
+          ├─ Confirmation           confirmation_decision    (success / cancelled / rejected, duration)
+          └─ Tool Gateway           tool_started → tool_completed / tool_failed  (operation, error_code, duration)
+                   └─► ServiceNow
+```
+
+- **Controlled vocabulary.** There are 10 `ObsEventName`s, 7 `ObsComponent`s
+  and 6 `ObsOutcome`s (`started`, `success`, `denied`, `rejected`,
+  `cancelled`, `failed`). Each event name allows only matching outcomes.
+- **Fields:** `timestamp`, `event_name`, `component`, `outcome`,
+  `correlation_id`, and optionally `request_id`, `action`, `duration_ms`
+  (monotonic clock), `user_ref`, `operation` (ServiceNow operation type),
+  `error_code`, `phase`, `previous_phase` and `metadata`.
+- **Privacy by construction.** No field accepts free text. `metadata` accepts
+  only the approved keys `route`, `intent`, `pending_action` and `stage`,
+  each with an enumerated value set. Messages, prompts, completions,
+  ServiceNow bodies, descriptions, work notes, tokens and headers cannot be
+  represented.
+- **Correlation.** Reuses BL-010's identifiers. Each Teams message gets a
+  `request_id` (the activity id if it is a plain identifier, otherwise a
+  UUID). While a create/update is active (COLLECTING, READY_FOR_CONFIRMATION
+  or EXECUTING), events carry the operation's stored correlation id;
+  otherwise they carry the request id. A finished operation's id is
+  therefore never reused. The per-request context lives in a `ContextVar`,
+  so concurrent requests stay isolated.
+- **State hook.** `add_transition_listener()` in `app/state.py` calls
+  observers after a successful transition. Observers cannot veto or alter
+  it, and any exception they raise is swallowed.
+- **Failure policy.** `ObservabilityLogger.record()` never raises. Failures
+  go to the sibling `app.observability_errors` logger (exception type only),
+  and business behaviour, authorization and confirmation are unaffected.
+- **Relation to BL-010.** Audit is the security record (with the AAD
+  object id); observability is operational telemetry (pseudonymous). They
+  share correlation ids but are separate channels.
+- **Destination.** Standard Python logging only. There is no OpenTelemetry,
+  Application Insights, SIEM or persistence.
 
 ---
 

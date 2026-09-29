@@ -2,12 +2,14 @@ import contextvars
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from microsoft_teams.apps import App, FastAPIAdapter
 
+import app.observability as obs
 from app.ai import classify_message
 from app.audit import (
     AuditEventType,
@@ -148,6 +150,108 @@ async def require_admin_api_key(
 
 @teams_app.on_message
 async def on_message(context):
+    """
+    Teams entry point.  BL-011 observes the request lifecycle around the
+    unchanged handler: request_started → … → request_completed /
+    request_failed, with duration and a correlation id.  Observation is
+    passive and never alters the handler's behaviour.
+    """
+    started = time.monotonic()
+
+    # BL-010: one audit request id per incoming Teams message.
+    request_id = safe_ref(getattr(context.activity, "id", None)) or new_correlation_id()
+    _AUDIT_REQUEST_ID.set(request_id)
+
+    correlation_id, user, phase = _observation_start(context, request_id)
+    token = obs.begin_request(correlation_id, request_id, user)
+    obs.observability.record(
+        obs.ObsEventName.REQUEST_STARTED, obs.ObsComponent.API, obs.ObsOutcome.STARTED,
+        phase=phase,
+    )
+    try:
+        await _handle_message(context)
+    except BaseException:
+        obs.mark_request_failed("unhandled_exception")
+        raise
+    finally:
+        ctx = obs.current_request()
+        failed = ctx.failed_code if ctx else None
+        obs.observability.record(
+            obs.ObsEventName.REQUEST_FAILED if failed else obs.ObsEventName.REQUEST_COMPLETED,
+            obs.ObsComponent.API,
+            obs.ObsOutcome.FAILED if failed else obs.ObsOutcome.SUCCESS,
+            error_code=failed,
+            duration_ms=obs.elapsed_ms(started),
+            phase=_observation_phase(context),
+        )
+        obs.end_request(token)
+
+
+def _teams_user_id(activity) -> str:
+    """Session key for the Teams user (unchanged BL-001..BL-010 logic)."""
+    return (
+        # Try both attribute names that different SDK versions expose.
+        getattr(getattr(activity, "from_", None), "aad_object_id", None)
+        or getattr(getattr(activity, "from_", None), "id", None)
+        or getattr(getattr(activity, "from_property", None), "aad_object_id", None)
+        or getattr(getattr(activity, "from_property", None), "id", None)
+        or "unknown-user"
+    )
+
+
+_ACTIVE_PHASES = (
+    ConversationPhase.COLLECTING,
+    ConversationPhase.READY_FOR_CONFIRMATION,
+    ConversationPhase.EXECUTING,
+)
+
+
+def _observation_start(context, request_id: str):
+    """
+    (correlation_id, user_ref, phase) for a new request — never raises.
+    An in-progress operation keeps its BL-010 correlation id; otherwise the
+    request gets its own (so a finished operation's id is never reused).
+    """
+    try:
+        activity = context.activity
+        identity = _identity_module.resolve_identity(
+            activity, channel_tenant_id=_channel_tenant_id(activity))
+        user = obs.user_ref(identity.user_id, identity.tenant_id)
+        if not (activity.text or "").strip():
+            return request_id, user, None
+        session = get_session(_teams_user_id(activity))
+        if session.phase in _ACTIVE_PHASES and safe_ref(session.correlation_id):
+            return session.correlation_id, user, session.phase.value
+        return request_id, user, session.phase.value
+    except Exception:  # noqa: BLE001 — observability must never break the request
+        return request_id, None, None
+
+
+def _observation_phase(context):
+    try:
+        if not (context.activity.text or "").strip():
+            return None
+        return get_session(_teams_user_id(context.activity)).phase.value
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _authorize(identity, action, stage=None):
+    """``authorize()`` observed by BL-011 (decision + latency); result unchanged."""
+    started = time.monotonic()
+    decision = authorize(identity, action)
+    obs.observability.record(
+        obs.ObsEventName.AUTHORIZATION_DECISION,
+        obs.ObsComponent.AUTHORIZATION,
+        obs.ObsOutcome.SUCCESS if decision.allowed else obs.ObsOutcome.DENIED,
+        action=action,
+        duration_ms=obs.elapsed_ms(started),
+        metadata={"stage": stage} if stage else None,
+    )
+    return decision
+
+
+async def _handle_message(context):
 
     user_message = (
         context.activity.text or ""
@@ -166,36 +270,7 @@ async def on_message(context):
     # Identify the Teams user
     # --------------------------------------------------------
 
-    user_id = (
-        # Try both attribute names that different SDK versions expose.
-        getattr(
-            getattr(context.activity, "from_", None),
-            "aad_object_id",
-            None,
-        )
-        or getattr(
-            getattr(context.activity, "from_", None),
-            "id",
-            None,
-        )
-        or getattr(
-            getattr(context.activity, "from_property", None),
-            "aad_object_id",
-            None,
-        )
-        or getattr(
-            getattr(context.activity, "from_property", None),
-            "id",
-            None,
-        )
-        or "unknown-user"
-    )
-
-
-    # BL-010: one audit request id per incoming Teams message.
-    _AUDIT_REQUEST_ID.set(
-        safe_ref(getattr(context.activity, "id", None)) or new_correlation_id()
-    )
+    user_id = _teams_user_id(context.activity)
 
     try:
 
@@ -239,7 +314,19 @@ async def on_message(context):
 
         if session.phase is ConversationPhase.READY_FOR_CONFIRMATION:
 
+            confirm_started = time.monotonic()
             decision = evaluate_confirmation(session, user_message)
+            obs.observability.record(
+                obs.ObsEventName.CONFIRMATION_DECISION,
+                obs.ObsComponent.CONFIRMATION,
+                obs.ObsOutcome.SUCCESS if decision.confirmed
+                else obs.ObsOutcome.CANCELLED if decision.cancelled
+                else obs.ObsOutcome.REJECTED,
+                action=_PENDING_AUDIT_ACTIONS.get(session.pending_action),
+                duration_ms=obs.elapsed_ms(confirm_started),
+                metadata={"pending_action": session.pending_action}
+                if session.pending_action in _PENDING_AUDIT_ACTIONS else None,
+            )
 
             if decision.confirmed:
                 _audit_session(AuditEventType.CONFIRMATION_ACCEPTED, context, session)
@@ -302,7 +389,13 @@ async def on_message(context):
         # falls through to the classifier below.
         # ----------------------------------------------------
 
+        route_started = time.monotonic()
         route = route_message(user_message)
+        obs.observability.record(
+            obs.ObsEventName.ROUTE_SELECTED, obs.ObsComponent.ROUTER, obs.ObsOutcome.SUCCESS,
+            duration_ms=obs.elapsed_ms(route_started),
+            metadata={"route": route.intent if route is not None else "none"},
+        )
 
         if route is not None and route.intent == "incident_status":
 
@@ -327,12 +420,18 @@ async def on_message(context):
         # Ask Ollama to classify the current message
         # ----------------------------------------------------
 
+        classify_started = time.monotonic()
         result = await classify_message(
             user_message
         )
 
         intent = result["intent"]
         summary = result["summary"]
+        obs.observability.record(
+            obs.ObsEventName.ROUTE_SELECTED, obs.ObsComponent.AI_CLASSIFIER, obs.ObsOutcome.SUCCESS,
+            duration_ms=obs.elapsed_ms(classify_started),
+            metadata={"intent": intent} if intent in obs.APPROVED_METADATA["intent"] else None,
+        )
 
 
         # ----------------------------------------------------
@@ -444,6 +543,7 @@ async def on_message(context):
 
     except Exception as exc:
 
+        obs.mark_request_failed("handler_exception")
         logger.error(
             "AI classification error for user %s: %s",
             user_id,
@@ -580,7 +680,7 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
         context.activity,
         channel_tenant_id=_channel_tenant_id(context.activity),
     )
-    authz = authorize(identity, AuthorizableAction.CREATE_INCIDENT)
+    authz = _authorize(identity, AuthorizableAction.CREATE_INCIDENT)
     correlation_id = session.correlation_id or _audit_request_id()
 
     if not authz.allowed:
@@ -698,7 +798,7 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
         context.activity,
         channel_tenant_id=_channel_tenant_id(context.activity),
     )
-    authz = authorize(identity, AuthorizableAction.READ_INCIDENT)
+    authz = _authorize(identity, AuthorizableAction.READ_INCIDENT)
 
     if not authz.allowed:
         logger.warning(
@@ -794,7 +894,7 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
         context.activity,
         channel_tenant_id=_channel_tenant_id(context.activity),
     )
-    if not authorize(identity, AuthorizableAction.UPDATE_INCIDENT).allowed:
+    if not _authorize(identity, AuthorizableAction.UPDATE_INCIDENT, "request_stage").allowed:
         logger.warning(
             "authorization denied for user=%r action=%r",
             identity.user_id,
@@ -806,7 +906,7 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
 
     # The current-value read is an incident read in its own right.
     read = dict(upd, action=AuthorizableAction.READ_INCIDENT)
-    read_authz = authorize(identity, AuthorizableAction.READ_INCIDENT)
+    read_authz = _authorize(identity, AuthorizableAction.READ_INCIDENT, "current_value_read")
     if not read_authz.allowed:
         _audit(AuditEventType.INCIDENT_READ_DENIED, context, **read)
         return _NOT_AUTHORISED_ACTION
@@ -920,7 +1020,7 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
         context.activity,
         channel_tenant_id=_channel_tenant_id(context.activity),
     )
-    authz = authorize(identity, AuthorizableAction.UPDATE_INCIDENT)
+    authz = _authorize(identity, AuthorizableAction.UPDATE_INCIDENT, "execution_stage")
     upd = dict(
         correlation_id=session.correlation_id or _audit_request_id(),
         action=AuthorizableAction.UPDATE_INCIDENT,
