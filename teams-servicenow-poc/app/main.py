@@ -24,10 +24,18 @@ from app.incident_collection import (
     start_incident_collection,
     validate_incident_payload,
 )
+from app.incident_status import (
+    NOT_AUTHORISED_MESSAGE,
+    format_incident_status,
+    lookup_failed_message,
+    not_found_message,
+)
+from app.router import route_message
 from app.security.authorization import AuthorizableAction, authorize
 from app.security.identity import ANONYMOUS, resolve_identity
 from app.tools import (
     CreateIncidentToolRequest,
+    GetIncidentToolRequest,
     ServiceNowToolAction,
     ServiceNowToolGateway,
     ToolResult,
@@ -239,6 +247,24 @@ async def on_message(context):
             await context.send(
                 "⏳ Your incident is still being created. "
                 "Please wait for the result before sending another request."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # BL-008: deterministic incident status lookup (BL-001
+        # router).  Read-only: no confirmation, no state change,
+        # no LLM.  Anything the router does not match exactly
+        # falls through to the classifier below.
+        # ----------------------------------------------------
+
+        route = route_message(user_message)
+
+        if route is not None and route.intent == "incident_status":
+
+            await context.send(
+                await _lookup_incident_status(context, route.incident_number)
             )
 
             return
@@ -495,6 +521,55 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
         "It will not be retried automatically. You can start a new "
         "incident request if needed."
     )
+
+
+# ============================================================
+# BL-008: INCIDENT STATUS LOOKUP
+# ============================================================
+
+async def _lookup_incident_status(context, incident_number: str) -> str:
+    """
+    Read one incident through the Tool Gateway and return the Teams reply.
+
+    identity → authorize(READ_INCIDENT) → gateway GET_INCIDENT (once, never
+    retried).  Returns a safe message for denial, not-found and failure.
+    """
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    authz = authorize(identity, AuthorizableAction.READ_INCIDENT)
+
+    if not authz.allowed:
+        logger.warning(
+            "authorization denied for user=%r action=%r",
+            identity.user_id,
+            AuthorizableAction.READ_INCIDENT.value,
+        )
+        return NOT_AUTHORISED_MESSAGE
+
+    try:
+        tool_result = await servicenow_gateway.execute(
+            identity,
+            authz,
+            ServiceNowToolAction.GET_INCIDENT,
+            GetIncidentToolRequest(incident_number=incident_number),
+        )
+    except Exception as exc:
+        logger.error(
+            "incident lookup: gateway raised %s for user=%r",
+            type(exc).__name__,
+            identity.user_id,
+        )
+        return lookup_failed_message(incident_number)
+
+    if tool_result.success and tool_result.incident:
+        return format_incident_status(tool_result.incident, incident_number)
+
+    if tool_result.error_code == "NOT_FOUND":
+        return not_found_message(incident_number)
+
+    return lookup_failed_message(incident_number)
 
 
 # ============================================================

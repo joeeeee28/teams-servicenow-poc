@@ -558,6 +558,51 @@ ServiceNowToolGateway.execute(CREATE_INCIDENT)    ← called exactly once
 
 ---
 
+## BL-008 — Incident Status Lookup
+
+A read-only lookup of one incident by number. `app/main.py` now calls the
+BL-001 router (`route_message`). The call happens after the COLLECTING,
+READY_FOR_CONFIRMATION and EXECUTING branches and before the LLM
+classifier.
+
+```
+message ─► route_message()  (BL-001, unchanged)
+              │ incident_status + normalised INC number
+              ▼
+resolve_identity → authorize(READ_INCIDENT)
+              │ denied ─► "not authorised to view this incident"   (no ServiceNow call)
+              ▼
+ServiceNowToolGateway.execute(GET_INCIDENT, GetIncidentToolRequest)   ← once, no retry
+              ├─ success   ─► app/incident_status.format_incident_status()
+              ├─ NOT_FOUND ─► "I couldn't find incident INC…."
+              └─ failure   ─► "I couldn't retrieve incident INC… right now."
+```
+
+- **Routing:** only the existing BL-001 whole-message patterns trigger a
+  lookup (a bare number, `status of`, `check`, `check status of`,
+  `what is the status of`; case-insensitive; no trailing punctuation).
+  Anything else, including appended or suspicious text, goes to the
+  classifier. The classifier's `incident_status` reply only asks for an
+  incident number and never performs a lookup.
+- **Validation:** `^INC\d{7,10}$`, enforced independently by the router,
+  the gateway and the adapter.
+- **No confirmation, no state change:** the lookup has no side effect. It
+  does not transition the conversation or modify the session. An
+  incident number sent while COLLECTING or READY_FOR_CONFIRMATION is
+  handled by that workflow, not looked up.
+- **Displayed fields:** the allowlist in `app/incident_status.STATUS_FIELDS`
+  (short description, description, state, impact, urgency, priority,
+  assignment group, assigned to). Missing fields are omitted. `sys_id`,
+  reference links and any other field are never shown. Reference fields
+  show only `display_value`.
+- **Adapter contract unchanged:** `ServiceNowClient.get_incident` returns
+  `number, short_description, state, impact, urgency, priority` (plus
+  `sys_id`). Description, assignment group and assigned to are therefore
+  not shown until that contract is extended. Values appear as returned by
+  ServiceNow (for example, `State: 2`).
+
+---
+
 ## Security Notes (all layers)
 
 - Credentials are read from the environment (`.env` / OS env); never
