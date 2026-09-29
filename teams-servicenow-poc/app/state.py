@@ -13,8 +13,8 @@ STATE MODEL
 ::
 
     IDLE ──► COLLECTING ──► READY_FOR_CONFIRMATION ──► EXECUTING ──► COMPLETED ──► IDLE
-                                     │                      │
-                                     ▼                      ▼
+                 │                   │                      │
+                 └──────────────►    ▼                      ▼
                                  CANCELLED              FAILED ──► IDLE
                                      │
                                      ▼
@@ -24,6 +24,7 @@ VALID TRANSITIONS
 ─────────────────
     IDLE                  → COLLECTING
     COLLECTING            → READY_FOR_CONFIRMATION
+    COLLECTING            → CANCELLED   (BL-006: user cancels during collection)
     READY_FOR_CONFIRMATION → EXECUTING
     READY_FOR_CONFIRMATION → CANCELLED
     EXECUTING             → COMPLETED
@@ -116,6 +117,7 @@ _VALID_TRANSITIONS: frozenset[tuple[ConversationPhase, ConversationPhase]] = fro
     {
         (ConversationPhase.IDLE,                   ConversationPhase.COLLECTING),
         (ConversationPhase.COLLECTING,             ConversationPhase.READY_FOR_CONFIRMATION),
+        (ConversationPhase.COLLECTING,             ConversationPhase.CANCELLED),
         (ConversationPhase.READY_FOR_CONFIRMATION, ConversationPhase.EXECUTING),
         (ConversationPhase.READY_FOR_CONFIRMATION, ConversationPhase.CANCELLED),
         (ConversationPhase.EXECUTING,              ConversationPhase.COMPLETED),

@@ -306,7 +306,14 @@ class TestInvalidTransitions(unittest.TestCase):
         self._assert_invalid(ConversationPhase.COLLECTING, ConversationPhase.EXECUTING)
 
     def test_collecting_to_cancelled(self):
-        self._assert_invalid(ConversationPhase.COLLECTING, ConversationPhase.CANCELLED)
+        # BL-006 made COLLECTING → CANCELLED valid (cancellation during
+        # incident collection).  COLLECTING → IDLE must remain invalid, so
+        # cancellation still passes through CANCELLED.
+        state = ConversationState(phase=ConversationPhase.COLLECTING)
+        state.transition_to(ConversationPhase.CANCELLED)
+        self.assertEqual(state.phase, ConversationPhase.CANCELLED)
+        state.transition_to(ConversationPhase.IDLE)
+        self.assertEqual(state.phase, ConversationPhase.IDLE)
 
     def test_ready_to_collecting(self):
         self._assert_invalid(

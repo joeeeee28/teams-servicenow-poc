@@ -26,6 +26,8 @@ FastAPI (app/main.py)
         │           │
         │           └─ ConversationState / InMemoryStateRepository
         │
+        ├─► [BL-006] Incident Collection (app/incident_collection.py)
+        │
         ├─► [BL-003] Confirmation / Side-effect Gate
         │
         ├─► [BL-004] Identity-aware Authorization
@@ -73,6 +75,7 @@ any ServiceNow operation.
 ```
 IDLE ──────────────────► COLLECTING
 COLLECTING ────────────► READY_FOR_CONFIRMATION
+COLLECTING ────────────► CANCELLED  (added in BL-006: cancel during collection)
 READY_FOR_CONFIRMATION ► EXECUTING
 READY_FOR_CONFIRMATION ► CANCELLED
 EXECUTING ─────────────► COMPLETED
@@ -409,6 +412,108 @@ Arbitrary table names, encoded queries, raw scripts, headers, or sys_id override
 ### Non-Idempotency & Retry Policy
 
 `CREATE_INCIDENT` is non-idempotent. The gateway does **not** automatically retry failed creation attempts to prevent duplicate ticket creation in ServiceNow.
+
+---
+
+## BL-006 — Incident Collection
+
+`app/incident_collection.py` collects the fields needed to create an
+incident **before** confirmation and before any ServiceNow execution.
+
+```
+"I need to report an issue"  → create_incident intent (AI classifier)
+        │
+        ▼
+IDLE ─► COLLECTING ──(all fields valid)──► READY_FOR_CONFIRMATION   ← BL-006 stops here
+            │                                      │
+            └─► CANCELLED ─► IDLE                  ▼
+                                         BL-003 gate → BL-004 → BL-005
+```
+
+### Responsibility
+
+- `start_incident_collection(state, message)` — `IDLE → COLLECTING`
+  (a terminal COMPLETED / FAILED / CANCELLED phase is first returned to
+  `IDLE` through its normal transition). Captures any details already in
+  the opening message; request wording such as "create an incident for"
+  is stripped first.
+- `process_collection_message(state, message)` — handles every message
+  while in `COLLECTING`. In `app/main.py` these messages go straight to the
+  collector; the LLM classifier is **not** called during collection.
+- Both return a `CollectionResult` (`reply`, `phase`, `missing`, `errors`,
+  `captured`, `cancelled`). The caller saves the state and sends `reply`.
+
+### Required fields (collection order)
+
+| Field | Rule |
+|---|---|
+| `short_description` | Non-empty, single line, ≤ 160 characters |
+| `description` | Non-empty, user-provided text |
+| `impact` | Exactly `"1"`, `"2"` or `"3"` |
+| `urgency` | Exactly `"1"`, `"2"` or `"3"` |
+
+The collected payload is stored in `ConversationState.collected_details`
+and contains **only** these four keys. Other keys (priority, assignment
+group, category, caller, sys_id, …) are dropped and never reach
+ServiceNow.
+
+### Deterministic extraction and validation
+
+- Labelled values anywhere in a message: `impact 2`, `urgency: 1`,
+  `impact is 2`, `short description: …`, `title: …`, `description: …`.
+- Unlabelled free text fills the text fields. If both are missing, the text
+  becomes the description and its first sentence becomes the short
+  description, but only if it is 160 characters or fewer. Otherwise the
+  user is asked for a concise short description. Nothing is truncated.
+- A bare answer (`2`) fills impact/urgency only when that field is the
+  one being asked for.
+- `0`, `4`, `5`, words such as `high`/`medium`/`low`, and free text are
+  rejected with "Impact must be 1, 2, or 3." / "Urgency must be 1, 2, or
+  3.". There is no word-to-number mapping. The conversation stays in
+  `COLLECTING`.
+- Missing values are **never** defaulted or inferred. The collector asks
+  for them.
+- Before `READY_FOR_CONFIRMATION`, the complete payload is re-validated
+  against `app.models.CreateIncidentRequest` (the established contract).
+
+### Corrections
+
+A later labelled value replaces the earlier one while collecting:
+"Actually impact should be 1", "Change urgency to 3", "Change the
+description to …", "The short description should be …". An invalid
+correction is rejected and the previous valid value is kept.
+
+### Cancellation
+
+Messages matching the BL-003 cancellation phrases (`cancel`, `stop`,
+`never mind`, `abort`, …; the same `_CANCEL_PHRASES` set) during
+collection transition `COLLECTING → CANCELLED → IDLE`, which clears all
+collected details. No incident is created and no further fields are
+requested.
+
+### READY_FOR_CONFIRMATION boundary
+
+When all four fields are valid, the collector sets `pending_action =
+"create_incident"` and `summary = short_description`, transitions to
+`READY_FOR_CONFIRMATION`, and replies with a summary listing **only** the
+four collected values followed by "Shall I create this incident?". It
+never transitions to `EXECUTING`. Accepting or rejecting the confirmation
+is handled entirely by BL-003. Words such as "okay" or "sure" are not
+treated as approval.
+
+### Boundaries
+
+The collector does not import or call ServiceNow, the Tool Gateway, the
+LLM, Teams, or any HTTP client. It does not read environment variables
+or credentials, and it logs field names only, never message content.
+
+### Known limitations
+
+- Corrections are only possible while in `COLLECTING`.
+  `READY_FOR_CONFIRMATION → COLLECTING` is not a valid transition, so after
+  the summary the user can only confirm or cancel.
+- The collection flow starts only when the AI classifier returns
+  `create_incident`.
 
 ---
 

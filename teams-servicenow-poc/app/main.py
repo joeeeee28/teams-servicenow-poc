@@ -18,6 +18,10 @@ from app.servicenow import (
     ServiceNowNotFound,
 )
 from app.confirmation import ConfirmationDecision, evaluate_confirmation
+from app.incident_collection import (
+    process_collection_message,
+    start_incident_collection,
+)
 from app.security.authorization import AuthorizableAction, authorize
 from app.security.identity import ANONYMOUS, resolve_identity
 from app.tools import (
@@ -166,32 +170,20 @@ async def on_message(context):
 
 
         # ----------------------------------------------------
-        # Handle follow-up questions during incident flow
+        # BL-006: Incident collection
+        # While collecting, every message goes to the deterministic
+        # collector — never to the LLM classifier, ServiceNow or the
+        # Tool Gateway.  The collector stops at READY_FOR_CONFIRMATION.
         # ----------------------------------------------------
 
-        if session.intent == "create_incident":
+        if session.phase is ConversationPhase.COLLECTING:
 
-            lower_message = user_message.lower()
+            collection = process_collection_message(session, user_message)
+            save_session(user_id, session)
 
-            if (
-                "what details" in lower_message
-                or "which details" in lower_message
-                or "details do you need" in lower_message
-                or "what information" in lower_message
-                or "what do you need" in lower_message
-            ):
+            await context.send(collection.reply)
 
-                await context.send(
-                    "🎫 To create the incident, I need a few details:\n\n"
-                    "1. **What is the problem?**\n"
-                    "2. **When did it start?**\n"
-                    "3. **What error message are you seeing?**\n"
-                    "4. **What troubleshooting have you already tried?**\n"
-                    "5. **Is the issue affecting only you or multiple users?**\n\n"
-                    "You can provide the details in one message."
-                )
-
-                return
+            return
 
 
         # ----------------------------------------------------
@@ -343,39 +335,21 @@ async def on_message(context):
 
         elif intent == "create_incident":
 
-            # BL-003: drive the state machine based on current phase.
+            # BL-006: start deterministic incident collection.  Details the
+            # user already gave are captured from their own message; the
+            # LLM summary is never used as an incident field value.
             session = get_session(user_id)
 
-            if session.phase is ConversationPhase.IDLE:
-                # Start collecting details.
-                session.transition_to(ConversationPhase.COLLECTING)
-                session.pending_action = "create_incident"
+            if session.phase in (
+                ConversationPhase.IDLE,
+                ConversationPhase.COMPLETED,
+                ConversationPhase.FAILED,
+                ConversationPhase.CANCELLED,
+            ):
+                collection = start_incident_collection(session, user_message)
                 save_session(user_id, session)
 
-                response = (
-                    f"🎫 I can help create an incident for:\n"
-                    f"**{summary}**\n\n"
-                    "Before I create it, I'll collect a few details.\n\n"
-                    "Please tell me:\n"
-                    "1. What is the problem?\n"
-                    "2. When did it start?\n"
-                    "3. What error message are you seeing?\n"
-                    "4. What troubleshooting have you already tried?\n"
-                    "5. Is the issue affecting only you or multiple users?"
-                )
-
-            elif session.phase is ConversationPhase.COLLECTING:
-                # Details are arriving — move to confirmation.
-                session.summary = summary
-                session.transition_to(ConversationPhase.READY_FOR_CONFIRMATION)
-                save_session(user_id, session)
-
-                response = (
-                    f"📋 Here is what I have for the incident:\n"
-                    f"**{summary}**\n\n"
-                    "Would you like me to submit this? "
-                    "Reply **yes** to confirm or **cancel** to cancel."
-                )
+                response = collection.reply
 
             else:
                 # Already past collecting — just acknowledge.
