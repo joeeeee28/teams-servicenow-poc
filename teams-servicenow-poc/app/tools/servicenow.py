@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 # Strict Incident number regex: INC followed by 7 to 10 digits
 _INCIDENT_NUMBER_RE = re.compile(r"^INC\d{7,10}$")
 
-# Approved impact and urgency values for ServiceNow
-_VALID_IMPACT_URGENCY = frozenset({"1", "2", "3", "4", "5"})
+# Approved impact and urgency values. Must stay consistent with the
+# established contract in app/models.py (pattern ^[1-3]$: 1=High, 2=Medium, 3=Low).
+_VALID_IMPACT_URGENCY = frozenset({"1", "2", "3"})
 
 
 # ===========================================================================
@@ -145,9 +146,9 @@ class CreateIncidentToolRequest:
     description : str
         Detailed description of the issue.
     impact : str
-        Impact scale ("1" to "5", default "3").
+        Impact scale ("1" to "3", default "3").
     urgency : str
-        Urgency scale ("1" to "5", default "3").
+        Urgency scale ("1" to "3", default "3").
     """
 
     short_description: str

@@ -391,8 +391,8 @@ Attempts to invoke `UPDATE_INCIDENT` with a `READ_INCIDENT` or `CREATE_INCIDENT`
 ### Typed Request Contracts
 
 - `GetIncidentToolRequest`: `incident_number` (validated with `^INC\d{7,10}$`).
-- `CreateIncidentToolRequest`: `short_description`, `description`, `impact` (`"1"`..`"5"`), `urgency` (`"1"`..`"5"`).
-- `UpdateIncidentToolRequest`: `incident_number`, `short_description` (optional), `description` (optional), `impact` (optional), `urgency` (optional).
+- `CreateIncidentToolRequest`: `short_description`, `description`, `impact` (`"1"`..`"3"`), `urgency` (`"1"`..`"3"`), consistent with `app/models.py`.
+- `UpdateIncidentToolRequest`: `incident_number`, `short_description` (optional), `description` (optional), `impact` (optional, `"1"`..`"3"`), `urgency` (optional, `"1"`..`"3"`).
 
 Arbitrary table names, encoded queries, raw scripts, headers, or sys_id overrides cannot be passed.
 

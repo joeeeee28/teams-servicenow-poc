@@ -45,6 +45,9 @@ Covers all 43 required test cases from the BL-005 specification:
 41.  GET_INCIDENT passes normalized incident number to adapter.
 42.  CREATE_INCIDENT passes only approved create fields.
 43.  UPDATE_INCIDENT passes only approved update fields.
+45.  CREATE_INCIDENT rejects impact/urgency outside the established 1-3 contract.
+46.  CREATE_INCIDENT accepts every impact/urgency value in the 1-3 contract.
+47.  UPDATE_INCIDENT rejects impact/urgency outside the established 1-3 contract.
 """
 
 from __future__ import annotations
@@ -962,6 +965,68 @@ class TestServiceNowToolGateway(unittest.IsolatedAsyncioTestCase):
                 req,
                 raise_on_error=True,
             )
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Test 45: Impact/urgency outside 1-3 rejected on create
+    # (contract: app/models.py pattern ^[1-3]$)
+    # ───────────────────────────────────────────────────────────────────────
+    async def test_45_create_rejects_impact_urgency_outside_contract(self):
+        authz = authorize(EMPLOYEE_IDENTITY, AuthorizableAction.CREATE_INCIDENT)
+        for field in ("impact", "urgency"):
+            for value in ("0", "4", "5"):
+                with self.subTest(field=field, value=value):
+                    req = CreateIncidentToolRequest(
+                        short_description="Test", **{field: value}
+                    )
+                    res = await self.gateway.execute(
+                        EMPLOYEE_IDENTITY, authz, ServiceNowToolAction.CREATE_INCIDENT, req
+                    )
+                    self.assertFalse(res.success)
+                    self.assertEqual(res.error_code, "VALIDATION_ERROR")
+        self.mock_client.create_incident.assert_not_called()
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Test 46: Every impact/urgency value in 1-3 accepted on create
+    # ───────────────────────────────────────────────────────────────────────
+    async def test_46_create_accepts_impact_urgency_within_contract(self):
+        authz = authorize(EMPLOYEE_IDENTITY, AuthorizableAction.CREATE_INCIDENT)
+        self.mock_client.create_incident.return_value = {
+            "sys_id": "1",
+            "number": "INC0010001",
+        }
+        for value in ("1", "2", "3"):
+            with self.subTest(value=value):
+                req = CreateIncidentToolRequest(
+                    short_description="Test", impact=value, urgency=value
+                )
+                res = await self.gateway.execute(
+                    EMPLOYEE_IDENTITY, authz, ServiceNowToolAction.CREATE_INCIDENT, req
+                )
+                self.assertTrue(res.success)
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Test 47: Impact/urgency outside 1-3 rejected on update
+    # ───────────────────────────────────────────────────────────────────────
+    async def test_47_update_rejects_impact_urgency_outside_contract(self):
+        class AgentPolicy(DefaultAuthorizationPolicy):
+            def resolve_role(self, identity):
+                return UserRole.SERVICE_DESK_AGENT
+
+        authz = authorize(
+            AGENT_IDENTITY, AuthorizableAction.UPDATE_INCIDENT, policy=AgentPolicy()
+        )
+        for field in ("impact", "urgency"):
+            for value in ("0", "4", "5"):
+                with self.subTest(field=field, value=value):
+                    req = UpdateIncidentToolRequest(
+                        incident_number="INC0010002", **{field: value}
+                    )
+                    res = await self.gateway.execute(
+                        AGENT_IDENTITY, authz, ServiceNowToolAction.UPDATE_INCIDENT, req
+                    )
+                    self.assertFalse(res.success)
+                    self.assertEqual(res.error_code, "VALIDATION_ERROR")
+        self.mock_client.update_incident.assert_not_called()
 
 
 if __name__ == "__main__":
