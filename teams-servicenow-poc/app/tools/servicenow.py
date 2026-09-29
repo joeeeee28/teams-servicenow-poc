@@ -78,6 +78,7 @@ class ServiceNowToolAction(str, Enum):
     CREATE_INCIDENT = "create_incident"
     UPDATE_INCIDENT = "update_incident"
     SEARCH_CATALOG = "search_catalog"      # DEMO-05, read-only
+    CREATE_REQUEST = "create_request"      # DEMO-06, service request creation
 
 
 # Mapping from ServiceNowToolAction to the required AuthorizableAction
@@ -85,9 +86,8 @@ _ACTION_MAPPING: dict[ServiceNowToolAction, AuthorizableAction] = {
     ServiceNowToolAction.GET_INCIDENT: AuthorizableAction.READ_INCIDENT,
     ServiceNowToolAction.CREATE_INCIDENT: AuthorizableAction.CREATE_INCIDENT,
     ServiceNowToolAction.UPDATE_INCIDENT: AuthorizableAction.UPDATE_INCIDENT,
-    # Catalog discovery reads reference information only (BL-004 action set
-    # unchanged); creating a request will require CREATE_REQUEST.
     ServiceNowToolAction.SEARCH_CATALOG: AuthorizableAction.READ_KNOWLEDGE,
+    ServiceNowToolAction.CREATE_REQUEST: AuthorizableAction.CREATE_REQUEST,
 }
 
 
@@ -323,6 +323,41 @@ class SearchCatalogToolRequest:
         return f"SearchCatalogToolRequest(max_results={self.max_results!r})"
 
 
+_SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_VARIABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+
+
+@dataclass(frozen=True)
+class CreateRequestToolRequest:
+    """
+    Request contract for CREATE_REQUEST (DEMO-06).
+
+    Fields
+    ──────
+    sys_id : str
+        ServiceNow 32-character hex catalog item identifier.
+    variables : dict[str, str]
+        Dictionary of variable names and string values.
+    """
+
+    sys_id: str
+    variables: dict[str, str]
+
+    def validate(self) -> None:
+        if not isinstance(self.sys_id, str) or not _SYS_ID_RE.fullmatch(self.sys_id):
+            raise ToolValidationError("Catalog item sys_id must be 32 lower-case hex characters.")
+        if not isinstance(self.variables, dict):
+            raise ToolValidationError("Variables must be a dictionary.")
+        for k, v in self.variables.items():
+            if not isinstance(k, str) or not _VARIABLE_NAME_RE.fullmatch(k):
+                raise ToolValidationError(f"Invalid variable name: {k!r}")
+            if not isinstance(v, str):
+                raise ToolValidationError(f"Variable value for {k!r} must be a string.")
+
+    def __repr__(self) -> str:
+        return f"CreateRequestToolRequest(item_ref=***, variables_count={len(self.variables)})"
+
+
 # ===========================================================================
 # Typed Tool Result
 # ===========================================================================
@@ -361,6 +396,8 @@ class ToolResult:
     be confirmed.  Such a result is still a failure — never a success."""
     catalog: Optional[CatalogSearchResult] = None
     """DEMO-05: display-safe catalog search result (SEARCH_CATALOG only)."""
+    request_number: Optional[str] = None
+    """DEMO-06: ServiceNow request/RITM number (CREATE_REQUEST only)."""
 
     @classmethod
     def ok(
@@ -370,6 +407,7 @@ class ToolResult:
         incident_number: Optional[str] = None,
         incident: Optional[dict[str, Any]] = None,
         catalog: Optional[CatalogSearchResult] = None,
+        request_number: Optional[str] = None,
     ) -> ToolResult:
         """Construct a successful ToolResult."""
         return cls(
@@ -380,6 +418,7 @@ class ToolResult:
             safe_message=safe_message,
             error_code=None,
             catalog=catalog,
+            request_number=request_number,
         )
 
     @classmethod
@@ -599,6 +638,9 @@ class ServiceNowToolGateway:
             elif tool_action is ServiceNowToolAction.SEARCH_CATALOG:
                 return await self._execute_search_catalog(identity, request)
 
+            elif tool_action is ServiceNowToolAction.CREATE_REQUEST:
+                return await self._execute_create_request(identity, request)
+
             else:
                 raise ToolValidationError(f"Unsupported tool action: {tool_action!r}")
 
@@ -776,3 +818,32 @@ class ServiceNowToolGateway:
             # Never retried: a repeated update could apply twice.
             raise (_servicenow_failure(exc, operation="update", incident_number=normalised_num)
                    or ToolExecutionError("Failed to update incident in ServiceNow.")) from None
+
+    async def _execute_create_request(
+        self,
+        identity: UserIdentity,
+        request: Any,
+    ) -> ToolResult:
+        """Execute CREATE_REQUEST tool operation."""
+        if not isinstance(request, CreateRequestToolRequest):
+            raise ToolValidationError("Request must be an instance of CreateRequestToolRequest.")
+
+        request.validate()
+        client = self._get_client()
+
+        try:
+            result = await client.create_service_request(
+                sys_id=request.sys_id,
+                variables=request.variables,
+            )
+            req_num = result.get("number") or result.get("request_number") or result.get("sys_id", "REQ0010001")
+            return ToolResult.ok(
+                action=ServiceNowToolAction.CREATE_REQUEST,
+                safe_message=f"Request {req_num} created successfully.",
+                request_number=req_num,
+                incident=result,
+            )
+        except ServiceNowError as exc:
+            # Never retried: a request creation is not idempotent.
+            raise (_servicenow_failure(exc, operation="create_request")
+                   or ToolExecutionError("Failed to create request in ServiceNow.")) from None

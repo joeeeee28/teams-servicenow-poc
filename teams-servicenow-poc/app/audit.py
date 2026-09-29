@@ -105,6 +105,13 @@ class AuditEventType(str, Enum):
     CATALOG_SEARCH_COMPLETED = "catalog_search_completed"
     CATALOG_SEARCH_FAILED = "catalog_search_failed"
 
+    # DEMO-06: service request creation.
+    REQUEST_CREATE_REQUESTED = "request_create_requested"
+    REQUEST_CREATE_AUTHORIZED = "request_create_authorized"
+    REQUEST_CREATE_DENIED = "request_create_denied"
+    REQUEST_CREATE_COMPLETED = "request_create_completed"
+    REQUEST_CREATE_FAILED = "request_create_failed"
+
 
 class AuditOutcome(str, Enum):
     REQUESTED = "requested"
@@ -148,7 +155,8 @@ DEFAULT_OUTCOME: dict[AuditEventType, AuditOutcome] = {
 # Tool names the gateway can execute (ServiceNowToolAction values), plus the
 # DEMO-03 read-only knowledge search.
 AUDIT_TOOLS = frozenset({"get_incident", "create_incident", "update_incident",
-                         "knowledge_search", "historical_case_search", "search_catalog"})
+                         "knowledge_search", "historical_case_search", "search_catalog",
+                         "create_request"})
 MAX_AUDIT_ARTICLES = 5
 MAX_AUDIT_ITEMS = 10
 

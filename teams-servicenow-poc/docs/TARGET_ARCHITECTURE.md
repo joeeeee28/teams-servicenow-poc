@@ -1392,6 +1392,51 @@ format_catalog_answer: one item / clarification / browse / honest no-match
 
 ---
 
+## DEMO-06 — Service Request Creation
+
+Building on the read-only catalog discovery of DEMO-05, DEMO-06 enables controlled creation of ServiceNow Service Catalog requests. When a user requests a catalog item (e.g. "I need Microsoft Visio"), the system resolves the item, gathers required variables via a deterministic collector (`app/request_collection.py`), prompts for explicit confirmation, authorizes the action (`AuthorizableAction.CREATE_REQUEST`), and executes request creation through the Tool Gateway (`ServiceNowToolAction.CREATE_REQUEST`).
+
+```
+Teams message ──► on_message (LLM classifies service_request)
+   │
+   ▼
+Catalog Search ──► Single item resolved (e.g. CAT0001 Microsoft Visio)
+   │
+   ▼
+Request Collector (app/request_collection.py)
+   │  • Gathers missing required variables (text or choice validation)
+   │  • All user input sanitized via safe_text() (DEMO-03 sanitizer)
+   │
+   ▼
+Confirmation Gate (app/confirmation.py) ── READY_FOR_CONFIRMATION
+   │  • Displays Item Name (CAT0001) & collected variables
+   │  • User replies "yes" to confirm or "cancel" to cancel
+   │
+   ▼
+Authorization (app/security/authorization.py) ── CREATE_REQUEST
+   │
+   ▼
+ServiceNow Tool Gateway (app/tools/servicenow.py)
+   │  • Executes CreateRequestToolRequest(sys_id, variables)
+   │  • Closed contract, masked repr, single execution (never auto-retried)
+   │
+   ▼
+ServiceNow Adapter (app/servicenow.py)
+   │  • Calls POST /api/sn_sc/v1/servicecatalog/items/{sys_id}/order_now
+   ▼
+Response & Audit (COMPLETED / FAILED → IDLE)
+   • Returns safe REQ number to user
+   • Records structured audit events & observability metrics
+```
+
+### Safety & Resilience Contracts
+
+- **Idempotency & In-Flight Guard**: While state is `EXECUTING`, incoming messages receive a wait message ("Your request is being created..."), preventing duplicate submissions.
+- **Ambiguous Write Handling**: On timeout or transport failure after POST transmission, state transitions to `FAILED → IDLE` and audits `UNKNOWN_OUTCOME`. The gateway does not automatically retry request creation.
+- **Data Privacy**: Audit events record `item_ref` (e.g. `CAT0001`) and `request_number` (e.g. `REQ0010001`). Raw `sys_id`s and variable text values are **never** written to audit logs.
+
+---
+
 ## Security Notes (all layers)
 
 - Credentials are read from the environment (`.env` / OS env); never

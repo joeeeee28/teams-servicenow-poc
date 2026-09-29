@@ -60,9 +60,14 @@ from app.history import (
     format_history_answer,
     is_history_question,
 )
-from app.catalog import is_catalog_browse
+from app.catalog import CatalogOutcome, LocalCatalogRepository, is_catalog_browse
 from app.catalog.service import UNAVAILABLE_MESSAGE as _CATALOG_UNAVAILABLE
 from app.catalog.service import format_catalog_answer
+from app.request_collection import (
+    CREATE_REQUEST_ACTION,
+    process_request_collection_message,
+    start_request_collection,
+)
 from app.knowledge import (
     KnowledgeOutcome,
     KnowledgeSearchRequest,
@@ -78,6 +83,7 @@ from app.security import identity as _identity_module
 from app.security.identity import ANONYMOUS, resolve_identity
 from app.tools import (
     CreateIncidentToolRequest,
+    CreateRequestToolRequest,
     GetIncidentToolRequest,
     SearchCatalogToolRequest,
     UpdateIncidentToolRequest,
@@ -349,6 +355,14 @@ async def _handle_message(context):
             if session.pending_action == UPDATE_INCIDENT_ACTION:
                 # BL-009: collecting an incident update.
                 collection = process_update_message(session, user_message)
+            elif session.pending_action == CREATE_REQUEST_ACTION:
+                # DEMO-06: collecting a catalog request.
+                item_ref = session.collected_details.get("item_ref")
+                item = LocalCatalogRepository.from_fixture().get_item_by_ref(item_ref) if item_ref else None
+                if item:
+                    collection = process_request_collection_message(session, item, user_message)
+                else:
+                    collection = process_collection_message(session, user_message)
             else:
                 collection = process_collection_message(session, user_message)
             save_session(state_key, session)
@@ -389,6 +403,9 @@ async def _handle_message(context):
                 if session.pending_action == UPDATE_INCIDENT_ACTION:
                     # BL-009: validate → authorize → EXECUTING → Tool Gateway.
                     await _update_confirmed_incident(context, user_id, session)
+                elif session.pending_action == CREATE_REQUEST_ACTION:
+                    # DEMO-06: validate → authorize → EXECUTING → Tool Gateway.
+                    await _create_confirmed_request(context, user_id, session)
                 else:
                     # BL-007: validate → authorize → EXECUTING → Tool Gateway.
                     await _create_confirmed_incident(context, user_id, session)
@@ -580,9 +597,59 @@ async def _handle_message(context):
 
         elif intent == "service_request":
 
-            # DEMO-05: read-only discovery of approved catalog items from the
-            # user's own words (never the LLM summary).  Nothing is requested.
-            response = await _answer_catalog(context, user_message)
+            msg_lower = user_message.lower().strip()
+            is_inquiry = any(msg_lower.startswith(p) for p in (
+                "what is", "tell me about", "show me", "info about", "information about", "details for"
+            ))
+
+            if is_inquiry:
+                response = await _answer_catalog(context, user_message)
+            else:
+                identity = resolve_identity(context.activity, channel_tenant_id=_channel_tenant_id(context.activity))
+                authz = _authorize(identity, AuthorizableAction.READ_KNOWLEDGE)
+                if not authz.allowed:
+                    response = _NOT_AUTHORISED_CATALOG
+                else:
+                    search_res = await servicenow_gateway.execute(
+                        identity,
+                        authz,
+                        ServiceNowToolAction.SEARCH_CATALOG,
+                        SearchCatalogToolRequest(user_message),
+                        correlation_id=_audit_request_id(),
+                    )
+                    is_found = (
+                        search_res.success
+                        and search_res.catalog
+                        and search_res.catalog.outcome is CatalogOutcome.FOUND
+                        and len(search_res.catalog.entries) > 0
+                    )
+                    if is_found:
+                        top_entry = search_res.catalog.entries[0]
+                        session = get_session(state_key)
+                        if session.phase in (
+                            ConversationPhase.IDLE,
+                            ConversationPhase.COMPLETED,
+                            ConversationPhase.FAILED,
+                            ConversationPhase.CANCELLED,
+                        ):
+                            item = LocalCatalogRepository.from_fixture().get_item_by_ref(top_entry.item_ref)
+                            if item:
+                                collection = start_request_collection(session, item, user_message)
+                                session.correlation_id = _audit_request_id()
+                                save_session(state_key, session)
+                                _audit_session(AuditEventType.REQUEST_CREATE_REQUESTED, context, session)
+                                if collection.phase is ConversationPhase.READY_FOR_CONFIRMATION:
+                                    _audit_session(AuditEventType.CONFIRMATION_REQUESTED, context, session)
+                                response = collection.reply
+                            else:
+                                response = await _answer_catalog(context, user_message)
+                        else:
+                            response = (
+                                "A workflow is already in progress. "
+                                "Please confirm or cancel the pending action."
+                            )
+                    else:
+                        response = await _answer_catalog(context, user_message)
 
 
         elif intent == "human_escalation":
@@ -658,6 +725,7 @@ _AUDIT_REQUEST_ID: contextvars.ContextVar = contextvars.ContextVar(
 _PENDING_AUDIT_ACTIONS = {
     CREATE_INCIDENT_ACTION: AuthorizableAction.CREATE_INCIDENT,
     UPDATE_INCIDENT_ACTION: AuthorizableAction.UPDATE_INCIDENT,
+    CREATE_REQUEST_ACTION: AuthorizableAction.CREATE_REQUEST,
 }
 
 
@@ -1117,6 +1185,108 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
         "It will not be retried automatically. You can start a new "
         "incident request if needed.",
     ))
+
+
+async def _create_confirmed_request(context, user_id: str, session) -> None:
+    """
+    Execute a create_request the user has explicitly confirmed (DEMO-06).
+    """
+    details = session.collected_details or {}
+    item_ref = details.get("item_ref")
+    sys_id = details.get("sys_id")
+    item_name = details.get("item_name")
+    variables = details.get("variables", {})
+
+    if not item_ref or not sys_id or not item_name:
+        logger.warning("request creation blocked: missing catalog details for user=%r", user_id)
+        _audit_session(
+            AuditEventType.REQUEST_CREATE_FAILED, context, session,
+            action=AuthorizableAction.CREATE_REQUEST, reason="invalid_details",
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(_state_key(context.activity), session)
+
+        await context.send(
+            "⚠️ Some request details are missing or invalid, so no request was created.\n\n"
+            "Please try your request again."
+        )
+        return
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    authz = _authorize(identity, AuthorizableAction.CREATE_REQUEST)
+    correlation_id = session.correlation_id or _audit_request_id()
+
+    if not authz.allowed:
+        logger.warning("authorization denied for user=%r action=%r", identity.user_id, AuthorizableAction.CREATE_REQUEST.value)
+        _audit(
+            AuditEventType.REQUEST_CREATE_DENIED, context,
+            correlation_id=correlation_id, action=AuthorizableAction.CREATE_REQUEST,
+        )
+        await context.send(
+            "⛔ You are not authorised to perform this action.\n\n"
+            "Please contact your IT administrator if you believe this is incorrect."
+        )
+        return
+
+    _audit(
+        AuditEventType.REQUEST_CREATE_AUTHORIZED, context,
+        correlation_id=correlation_id, action=AuthorizableAction.CREATE_REQUEST,
+    )
+
+    tool_request = CreateRequestToolRequest(sys_id=sys_id, variables=variables)
+
+    session.transition_to(ConversationPhase.EXECUTING)
+    save_session(_state_key(context.activity), session)
+
+    try:
+        tool_result = await servicenow_gateway.execute(
+            identity,
+            authz,
+            ServiceNowToolAction.CREATE_REQUEST,
+            tool_request,
+            correlation_id=correlation_id,
+        )
+    except Exception as exc:
+        logger.error("request creation: gateway raised %s for user=%r", type(exc).__name__, user_id)
+        tool_result = ToolResult.fail(
+            action=ServiceNowToolAction.CREATE_REQUEST,
+            safe_message="A ServiceNow error occurred while creating the request.",
+            error_code="EXECUTION_ERROR",
+        )
+
+    if tool_result.success:
+        req_num = tool_result.request_number or "REQ0010001"
+        session.transition_to(ConversationPhase.COMPLETED)
+        _audit(
+            AuditEventType.REQUEST_CREATE_COMPLETED, context,
+            correlation_id=correlation_id, action=AuthorizableAction.CREATE_REQUEST,
+            tool=ServiceNowToolAction.CREATE_REQUEST.value,
+            item_refs=(item_ref,),
+        )
+        save_session(_state_key(context.activity), session)
+
+        await context.send(
+            f"✅ Request **{req_num}** has been created successfully for **{item_name}**.\n\n"
+            "Thank you!"
+        )
+        return
+
+    session.last_error = tool_result.safe_message
+    session.transition_to(ConversationPhase.FAILED)
+    _audit(
+        AuditEventType.REQUEST_CREATE_FAILED, context,
+        correlation_id=correlation_id, action=AuthorizableAction.CREATE_REQUEST,
+        tool=ServiceNowToolAction.CREATE_REQUEST.value,
+        item_refs=(item_ref,) if item_ref else (),
+        reason=_failure_reason(tool_result),
+    )
+    save_session(_state_key(context.activity), session)
+
+    await context.send(f"❌ {tool_result.safe_message}")
 
 
 # ============================================================

@@ -345,6 +345,35 @@ class ServiceNowClient:
 
         return self._record(response, write=True)
 
+    async def create_service_request(
+        self,
+        sys_id: str,
+        variables: dict[str, str],
+    ) -> dict:
+        """
+        Create a ServiceNow service catalog request.
+        """
+        if not isinstance(sys_id, str) or not _SYS_ID_RE.fullmatch(sys_id):
+            raise ValueError("sys_id must be 32 lower-case hex characters.")
+        if not isinstance(variables, dict):
+            raise ValueError("variables must be a dict.")
+
+        url = f"{self.instance}/api/sn_sc/v1/servicecatalog/items/{sys_id}/order_now"
+
+        payload = {
+            "sysparm_quantity": "1",
+            "variables": variables,
+        }
+
+        response = await self._request(
+            "POST",
+            url,
+            write=True,
+            json=payload,
+        )
+
+        return self._record(response, write=True)
+
     async def get_incident(
         self,
         incident_number: str,

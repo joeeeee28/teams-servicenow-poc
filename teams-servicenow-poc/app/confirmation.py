@@ -95,8 +95,7 @@ EXECUTABLE_ACTIONS: frozenset[str] = frozenset(
     {
         "create_incident",
         "update_incident",  # BL-009
-        # Future: "submit_service_request", etc.
-        # Add identifiers here only when BL-005 implements their execution.
+        "create_request",   # DEMO-06
     }
 )
 

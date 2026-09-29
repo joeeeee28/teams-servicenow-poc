@@ -118,3 +118,9 @@ class LocalCatalogRepository(CatalogRepository):
 
     async def list_available(self) -> Sequence[CatalogItem]:
         return tuple(e.item for e in self._index if e.item.available)
+
+    def get_item_by_ref(self, item_ref: str) -> Optional[CatalogItem]:
+        for entry in self._index:
+            if entry.item.item_ref == item_ref and entry.item.available:
+                return entry.item
+        return None

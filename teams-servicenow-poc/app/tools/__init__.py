@@ -10,6 +10,7 @@ servicenow.py
 
 from app.tools.servicenow import (
     CreateIncidentToolRequest,
+    CreateRequestToolRequest,
     GetIncidentToolRequest,
     SearchCatalogToolRequest,
     ServiceNowToolAction,
@@ -29,6 +30,7 @@ __all__ = [
     "CreateIncidentToolRequest",
     "UpdateIncidentToolRequest",
     "SearchCatalogToolRequest",
+    "CreateRequestToolRequest",
     "ToolResult",
     "ServiceNowToolGateway",
     "ToolGatewayError",

@@ -556,11 +556,11 @@ class _Integration(unittest.IsolatedAsyncioTestCase):
 class TestHandler(_Integration):
 
     async def test_service_request_intent_discovers_item(self):
-        reply = await self._send("I need Microsoft Visio.")
+        reply = await self._send("Show me Microsoft Visio.")
         self.assertIn("**Microsoft Visio** (CAT0001)", reply)
         self.assertIn("- Business justification", reply)
         self.assertNotIn(LLM_SUMMARY, reply)
-        self.classify.assert_awaited_once_with("I need Microsoft Visio.")
+        self.classify.assert_awaited_once_with("Show me Microsoft Visio.")
 
     async def test_browse_phrase_needs_no_llm(self):
         self.classify.side_effect = AssertionError("LLM called")
@@ -570,7 +570,7 @@ class TestHandler(_Integration):
 
     async def test_goes_through_the_tool_gateway(self):
         with patch.object(self.gateway, "execute", wraps=self.gateway.execute) as execute:
-            await self._send("I need Microsoft Visio.")
+            await self._send("Show me Microsoft Visio.")
         execute.assert_awaited_once()
         self.assertIs(execute.call_args.args[2], ServiceNowToolAction.SEARCH_CATALOG)
         self.assertIs(execute.call_args.args[1].action, AuthorizableAction.READ_KNOWLEDGE)
@@ -579,7 +579,7 @@ class TestHandler(_Integration):
         completed = ConversationState(phase=ConversationPhase.COMPLETED,
                                       incident_number="INC0012345", correlation_id="op-1")
         save_session(KEY, completed)
-        reply = await self._send("I need Microsoft Visio.")
+        reply = await self._send("Show me Microsoft Visio.")
         self.assertIn("no request has been created", reply)
         state = get_session(KEY)
         self.assertIs(state.phase, ConversationPhase.COMPLETED)
@@ -605,7 +605,7 @@ class TestHandler(_Integration):
 
     async def test_gateway_exception_is_controlled(self):
         with patch.object(self.gateway, "execute", AsyncMock(side_effect=RuntimeError("hunter2"))):
-            self.assertEqual(await self._send("I need Microsoft Visio."), UNAVAILABLE_MESSAGE)
+            self.assertEqual(await self._send("Show me Microsoft Visio."), UNAVAILABLE_MESSAGE)
         self.assertNotIn("hunter2", self._blob())
         failed = self.audit.of(AuditEventType.CATALOG_SEARCH_FAILED)
         self.assertEqual([e.reason for e in failed], ["execution_error"])
@@ -619,7 +619,7 @@ class TestHandler(_Integration):
                 raise RuntimeError("x")
 
         self.gateway._catalog = Broken()
-        self.assertEqual(await self._send("I need Microsoft Visio."), UNAVAILABLE_MESSAGE)
+        self.assertEqual(await self._send("Show me Microsoft Visio."), UNAVAILABLE_MESSAGE)
 
 
 BROWSE_PHRASES = ("What can I request?", "What's in the catalog?", "Show me the service catalog",
@@ -694,7 +694,7 @@ class TestHandlerAuthorization(_Integration):
 
     async def _assert_denied(self, **ctx):
         with patch.object(self.gateway, "execute", AsyncMock()) as execute:
-            reply = await self._send("I need Microsoft Visio.", **ctx)
+            reply = await self._send("Show me Microsoft Visio.", **ctx)
         self.assertIn("not authorised to browse the service catalog", reply)
         execute.assert_not_called()
         self.assertEqual(len(self.audit.of(AuditEventType.CATALOG_SEARCH_DENIED)), 1)
@@ -713,7 +713,7 @@ class TestHandlerAuthorization(_Integration):
 class TestHandlerPrivacyAndIsolation(_Integration):
 
     async def test_audit_and_observability_hold_refs_and_counts_only(self):
-        await self._send("I need Microsoft Visio. my password is hunter2")
+        await self._send("Show me Microsoft Visio. my password is hunter2")
         completed = self.audit.of(AuditEventType.CATALOG_SEARCH_COMPLETED)
         data = json.loads(completed[0].to_json())
         self.assertEqual((data["tool"], data["action"]), ("search_catalog", "read_knowledge"))
@@ -737,7 +737,7 @@ class TestHandlerPrivacyAndIsolation(_Integration):
         save_session(KEY, pending)
         for ctx in ({"conversation": OTHER_CONV}, {"user": OTHER_USER}):
             with self.subTest(**ctx):
-                self.assertIn("CAT0001", await self._send("I need Microsoft Visio.", **ctx))
+                self.assertIn("CAT0001", await self._send("Show me Microsoft Visio.", **ctx))
                 self.assertIs(get_session(KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
 
     async def test_persistent_state_holds_no_catalog_content(self):
@@ -746,7 +746,7 @@ class TestHandlerPrivacyAndIsolation(_Integration):
         path = Path(tmp.name) / "state.db"
         repo = SqliteStateRepository(path)
         configure_state_repository(repo)
-        await self._send("I need Microsoft Visio.")
+        await self._send("Show me Microsoft Visio.")
         repo.close()
         raw = b"".join(p.read_bytes() for p in path.parent.iterdir())
         rows = sqlite3.connect(path).execute("SELECT state_json FROM conversation_state").fetchall()
