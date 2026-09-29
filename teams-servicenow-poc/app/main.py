@@ -51,6 +51,14 @@ from app.incident_update import (
     unsupported_fields_message,
     validated_update,
 )
+from app.knowledge import (
+    KnowledgeOutcome,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResult,
+    KnowledgeService,
+    LocalKnowledgeRepository,
+    format_knowledge_answer,
+)
 from app.router import route_message
 from app.servicenow_errors import CATEGORY_CODES
 from app.security.authorization import AuthorizableAction, authorize
@@ -484,22 +492,12 @@ async def _handle_message(context):
         # Generate response
         # ----------------------------------------------------
 
-        if intent == "diagnose":
+        if intent in ("diagnose", "find_solution"):
 
-            response = (
-                f"🔍 I understand you're having an issue:\n"
-                f"**{summary}**\n\n"
-                "I'll help you troubleshoot it."
-            )
-
-
-        elif intent == "find_solution":
-
-            response = (
-                f"📚 You're looking for a solution for:\n"
-                f"**{summary}**\n\n"
-                "I'll help you find the relevant guidance."
-            )
+            # DEMO-03: answer from approved knowledge.  Retrieval uses the
+            # user's own words (never the LLM summary), is read-only, and
+            # never creates, updates or confirms anything.
+            response = await _answer_knowledge(context, user_message)
 
 
         elif intent == "create_incident":
@@ -720,6 +718,78 @@ def _write_failure_reply(tool_result, legacy: str) -> str:
     if _classified(tool_result):
         return ("⚠️ " if tool_result.outcome_unknown else "❌ ") + tool_result.safe_message
     return legacy
+
+
+# ============================================================
+# DEMO-03: ENTERPRISE KNOWLEDGE (read-only, no side effects)
+# ============================================================
+
+knowledge_service = KnowledgeService(LocalKnowledgeRepository.from_fixture())
+
+_NOT_AUTHORISED_KNOWLEDGE = (
+    "⛔ You are not authorised to search the knowledge base.\n\n"
+    "Please contact your IT administrator if you believe this is incorrect."
+)
+
+
+async def _answer_knowledge(context, user_message: str) -> str:
+    """
+    identity → authorize(READ_KNOWLEDGE) → KnowledgeService.search → grounded,
+    cited reply.  No ServiceNow call, no tool gateway, no state change, no
+    confirmation.  Audit / observability record ids and counts only — never
+    the query text or article bodies.
+    """
+    base = dict(
+        correlation_id=_audit_request_id(),
+        action=AuthorizableAction.READ_KNOWLEDGE,
+        tool="knowledge_search",
+    )
+    _audit(AuditEventType.KNOWLEDGE_SEARCH_REQUESTED, context, **base)
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    if not _authorize(identity, AuthorizableAction.READ_KNOWLEDGE).allowed:
+        _audit(AuditEventType.KNOWLEDGE_SEARCH_DENIED, context, **base)
+        return _NOT_AUTHORISED_KNOWLEDGE
+    _audit(AuditEventType.KNOWLEDGE_SEARCH_AUTHORIZED, context, **base)
+
+    observe = dict(
+        action=AuthorizableAction.READ_KNOWLEDGE,
+        operation="knowledge_search",
+        correlation_id=base["correlation_id"],
+    )
+    obs.observability.record(obs.ObsEventName.TOOL_STARTED, obs.ObsComponent.KNOWLEDGE,
+                             obs.ObsOutcome.STARTED, **observe)
+    started = time.monotonic()
+    try:
+        result = await knowledge_service.search(KnowledgeSearchRequest(user_message))
+    except Exception as exc:  # noqa: BLE001 — the service should never raise
+        logger.error("knowledge search raised %s", type(exc).__name__)
+        result = KnowledgeSearchResult(KnowledgeOutcome.UNAVAILABLE)
+    duration = obs.elapsed_ms(started)
+
+    if result.outcome in (KnowledgeOutcome.UNAVAILABLE, KnowledgeOutcome.EMPTY_QUERY):
+        unavailable = result.outcome is KnowledgeOutcome.UNAVAILABLE
+        reason = "knowledge_unavailable" if unavailable else "empty_query"
+        _audit(AuditEventType.KNOWLEDGE_SEARCH_FAILED, context, reason=reason,
+               outcome=AuditOutcome.FAILED if unavailable else AuditOutcome.REJECTED, **base)
+        obs.observability.record(
+            obs.ObsEventName.TOOL_FAILED, obs.ObsComponent.KNOWLEDGE,
+            obs.ObsOutcome.FAILED if unavailable else obs.ObsOutcome.REJECTED,
+            error_code=reason, duration_ms=duration, **observe,
+        )
+    else:
+        _audit(AuditEventType.KNOWLEDGE_SEARCH_COMPLETED, context,
+               result_count=len(result.hits), article_ids=result.article_ids,
+               reason="content_withheld" if result.withheld else None, **base)
+        obs.observability.record(
+            obs.ObsEventName.TOOL_COMPLETED, obs.ObsComponent.KNOWLEDGE,
+            obs.ObsOutcome.SUCCESS, result_count=len(result.hits),
+            duration_ms=duration, **observe,
+        )
+    return format_knowledge_answer(result)
 
 
 # ============================================================

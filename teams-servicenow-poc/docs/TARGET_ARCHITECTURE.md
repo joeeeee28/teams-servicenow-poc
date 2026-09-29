@@ -22,6 +22,8 @@ FastAPI (app/main.py)
         │
         ├─► AI Classifier (app/ai.py / Ollama)
         │
+        ├─► [DEMO-03] Knowledge (app/knowledge/) — read-only, no side effects
+        │
         ├─► Conversation State Machine (app/state.py)  ← BL-002
         │           │
         │           └─ ConversationState / StateRepository (StateKey)
@@ -990,6 +992,161 @@ ServiceNow category is still audited before the state save.
   IT) checks ServiceNow. A future version could look up a
   correlation-tagged incident.
 - `Retry-After` on 429 is not surfaced. The message says "shortly".
+
+---
+
+## DEMO-03 — Enterprise Knowledge
+
+Employees can ask troubleshooting questions and get answers drawn only from
+approved knowledge, with citations. A knowledge lookup is read-only. It
+never calls ServiceNow or the Tool Gateway, never changes conversation state
+and never needs confirmation.
+
+```
+Teams message
+   │
+   ▼
+app/main.py on_message ── LLM classifier: intent only (diagnose / find_solution)
+   │                         (receives the user message, nothing else)
+   ▼
+_answer_knowledge ── identity → authorize(READ_KNOWLEDGE) → audit / observability
+   │
+   ▼
+KnowledgeService (app/knowledge/service.py)
+   │  KnowledgeSearchRequest(user's own words → normalized tokens)
+   ▼
+KnowledgeRepository (interface) ── LocalKnowledgeRepository (POC, in memory)
+   │                               └ future: ServiceNowKnowledgeRepository
+   ▼
+approval re-check → sanitize (untrusted data) → KnowledgeHit + Citation
+   │
+   ▼
+format_knowledge_answer: extractive steps + "Source: KB… — Title (Source)"
+```
+
+### Components
+
+| Module | Role |
+|---|---|
+| `app/knowledge/models.py` | `KnowledgeArticle` (validated, immutable: `article_id` `KB` + 7 digits, title, body, category, status, source, metadata), `KnowledgeSearchRequest`, `KnowledgeSearchResult`, `KnowledgeHit`, `Citation` |
+| `app/knowledge/repository.py` | `KnowledgeRepository` interface; `LocalKnowledgeRepository` |
+| `app/knowledge/fixture.py` | Local POC content, compiled in as Python records (VPN, password reset, MFA, Teams, Outlook, incident guidance, plus one draft and one retired article) |
+| `app/knowledge/sanitize.py` | Deterministic, rule-based sanitization |
+| `app/knowledge/service.py` | `KnowledgeService`, `format_knowledge_answer` |
+
+- **Local POC repository.** It is built once from Python records. There is no
+  file, database or network access. Malformed records are skipped and logged
+  by position only.
+- **Future ServiceNow repository.** A `ServiceNowKnowledgeRepository` would
+  implement the same `search(KnowledgeSearchRequest)` through a dedicated,
+  allowlisted knowledge endpoint behind its own gateway, never the generic
+  Table API. The handler and service would not change.
+
+### Retrieval
+
+- The query is always the user's own message, never the LLM summary.
+- The query is normalized: NFKC, casefold, alphanumeric tokens, stopwords
+  removed, light suffix stemming, at most 500 characters and 32 tokens. An
+  empty result is reported as "please describe the problem".
+- Score = 3 × title matches + 2 × keyword matches + 1 × body matches, counted
+  over distinct query tokens. Candidates scoring below 3 are dropped. Ties are
+  broken by article id. The result is deterministic and doesn't depend on
+  input order. At most 3 results are returned (maximum 5).
+- Only `approved` articles are returned. The service checks approval again,
+  so a faulty repository cannot surface draft or retired content.
+
+### Untrusted content and prompt-injection defense
+
+Article text is data. It is never executed, never used for routing,
+authorization, confirmation or tool selection, and in this POC it is **never
+sent to the LLM**. The answer is assembled extractively in code. Fixed rules
+are applied on top of that, without relying on the LLM:
+
+- **Instruction-like content quarantines the whole article.** This covers
+  text such as "ignore/disregard … instructions/policy", "system prompt", "you
+  are now", "reveal … password/token/secret", "call/invoke/execute …
+  ServiceNow/API/tool", script tags and code fences. A compromised article is
+  not shown at all. The count is audited as `content_withheld`.
+- **Lines are dropped** when they contain:
+  - secrets: `password:` / `token=` / `api key`, "the shared password is",
+    `Bearer …`, `Authorization:`, private keys, `sk-…`, JWTs, connection
+    strings;
+  - internal or private notes: work notes, internal comments, `[Internal]`,
+    agent-only, do-not-share;
+  - personal data: e-mail addresses, phone numbers;
+  - infrastructure details: IP addresses, `*.corp` / `.internal` / `.local`
+    hostnames, UNC paths;
+  - URLs, HTML and markdown links.
+  Each line is first normalized: NFKC (so fullwidth letters become ASCII),
+  zero-width, soft-hyphen, control and bidi characters removed, and markdown
+  emphasis (`*`, `_`, backticks, `~`) removed. The checks run on that
+  normalized text, both the whole line and the step text without its number,
+  and the displayed text is built from the same normalized text. Injection
+  checks also run on the original line, because code fences are themselves a
+  signal.
+- Control and bidirectional-override characters are stripped. Lines are
+  capped at 300 characters and steps at 8.
+- **Metadata** (keywords, owner, review data) is used for ranking only and
+  never displayed.
+- **Unsafe results are withheld.** An article whose title is unsafe, or that
+  has nothing safe left, is withheld.
+
+### Grounding and citations
+
+- Every step shown comes verbatim (after sanitization) from an approved
+  article. No procedure, command, URL, credential or policy is generated.
+- The best article is shown with a `Source: <KB id> — <Title> (<Source>)`
+  line. Other matches are listed as "Related articles" with the same citation
+  format.
+- Citations can only name articles that were actually retrieved, so they
+  can't be fabricated.
+- No match gives "I couldn't find an approved knowledge article for that",
+  plus an offer to say "create an incident". Nothing is created
+  automatically.
+- The answer never claims that ServiceNow was checked.
+
+### Integration, authorization and no side effects
+
+- The existing classifier intents `diagnose` and `find_solution` route to
+  `_answer_knowledge`. The classifier prompt and the BL-001 router are
+  unchanged. Messages in COLLECTING, READY_FOR_CONFIRMATION or EXECUTING
+  still go to the collector or the confirmation gate first, so a question can
+  never interrupt a pending action.
+- `authorize(identity, READ_KNOWLEDGE)` runs first; the action already
+  existed in the BL-004 policy for every role. A wrong or missing tenant, or
+  an anonymous user, is denied, and the repository is never searched.
+- The knowledge package imports no ServiceNow, tool gateway, state, LLM,
+  filesystem or network module. Tests enforce this by inspecting the import
+  graph.
+
+### Audit and observability
+
+- **Audit:** `knowledge_search_requested / _authorized / _denied / _completed
+  / _failed`, with `action=read_knowledge` and `tool=knowledge_search`.
+  - `_completed` carries `result_count` and `article_ids` (validated
+    `KB` + 7 digits, at most 5), plus `reason=content_withheld` when an
+    article was quarantined.
+  - `_failed` carries `knowledge_unavailable` or `empty_query`.
+- **Observability:** `tool_started` / `tool_completed` / `tool_failed` with
+  `component=knowledge`, `operation=knowledge_search`, `duration_ms` and
+  `result_count`.
+- The query text, article titles and bodies, and the LLM summary are never
+  logged. Persistent state gains nothing new; only the existing intent is
+  stored.
+
+### Limitations (POC)
+
+- Keyword retrieval with light stemming and no synonyms beyond article
+  keywords. There is no semantic or vector search.
+- Only `diagnose` / `find_solution` reach knowledge, so if the LLM is
+  unavailable (the intent falls back to `general`), knowledge isn't
+  consulted.
+- Sanitization is rule-based. False positives (for example an article saying
+  "execute the following command", or a line with a version number that
+  looks like a phone number) are dropped or quarantined, the safe failure
+  direction. False negatives are possible for secrets in unusual formats.
+- Knowledge is not tenant-scoped. BL-004 restricts use to the configured
+  tenant.
 
 ---
 

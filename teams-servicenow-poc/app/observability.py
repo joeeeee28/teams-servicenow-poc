@@ -83,6 +83,7 @@ class ObsComponent(str, Enum):
     AUTHORIZATION = "authorization"
     CONFIRMATION = "confirmation"
     TOOL_GATEWAY = "tool_gateway"
+    KNOWLEDGE = "knowledge"          # DEMO-03 read-only knowledge search
 
 
 class ObsOutcome(str, Enum):
@@ -109,8 +110,10 @@ _ALLOWED_OUTCOMES: dict[ObsEventName, frozenset[ObsOutcome]] = {
         {ObsOutcome.FAILED, ObsOutcome.DENIED, ObsOutcome.REJECTED}),
 }
 
-# ServiceNow operation types (ServiceNowToolAction values).
-OPERATIONS = frozenset({"get_incident", "create_incident", "update_incident"})
+# ServiceNow operation types (ServiceNowToolAction values), plus the DEMO-03
+# read-only knowledge search.
+OPERATIONS = frozenset({"get_incident", "create_incident", "update_incident",
+                        "knowledge_search"})
 
 # The ONLY metadata keys, each with its enumerated values.
 APPROVED_METADATA: dict[str, frozenset[str]] = {
@@ -173,6 +176,7 @@ class ObsEvent:
     error_code: Optional[str] = None
     phase: Optional[str] = None
     previous_phase: Optional[str] = None
+    result_count: Optional[int] = None
     metadata: dict[str, str] = field(default_factory=dict)
     timestamp: str = field(default_factory=_utc_now)
 
@@ -204,6 +208,11 @@ class ObsEvent:
             or self.duration_ms < 0
         ):
             raise ValueError("duration_ms must be a non-negative number")
+        if self.result_count is not None and (
+            isinstance(self.result_count, bool) or not isinstance(self.result_count, int)
+            or not 0 <= self.result_count <= 100
+        ):
+            raise ValueError("result_count must be a small non-negative integer")
         if not isinstance(self.metadata, dict):
             raise ValueError("metadata must be a dict")
         for key, value in self.metadata.items():
@@ -226,6 +235,7 @@ class ObsEvent:
             "error_code": self.error_code,
             "phase": self.phase,
             "previous_phase": self.previous_phase,
+            "result_count": self.result_count,
             "metadata": dict(self.metadata) or None,
         }
         return {k: v for k, v in data.items() if v is not None}

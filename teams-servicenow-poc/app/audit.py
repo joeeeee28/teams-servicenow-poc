@@ -84,6 +84,13 @@ class AuditEventType(str, Enum):
     AUTHORIZATION_DENIED = "authorization_denied"
     TOOL_EXECUTION_REJECTED = "tool_execution_rejected"
 
+    # DEMO-03: read-only knowledge search.
+    KNOWLEDGE_SEARCH_REQUESTED = "knowledge_search_requested"
+    KNOWLEDGE_SEARCH_AUTHORIZED = "knowledge_search_authorized"
+    KNOWLEDGE_SEARCH_DENIED = "knowledge_search_denied"
+    KNOWLEDGE_SEARCH_COMPLETED = "knowledge_search_completed"
+    KNOWLEDGE_SEARCH_FAILED = "knowledge_search_failed"
+
 
 class AuditOutcome(str, Enum):
     REQUESTED = "requested"
@@ -124,8 +131,11 @@ DEFAULT_OUTCOME: dict[AuditEventType, AuditOutcome] = {
     for t in AuditEventType
 }
 
-# Tool names the gateway can execute (ServiceNowToolAction values).
-AUDIT_TOOLS = frozenset({"get_incident", "create_incident", "update_incident"})
+# Tool names the gateway can execute (ServiceNowToolAction values), plus the
+# DEMO-03 read-only knowledge search.
+AUDIT_TOOLS = frozenset({"get_incident", "create_incident", "update_incident",
+                         "knowledge_search"})
+MAX_AUDIT_ARTICLES = 5
 
 
 # ===========================================================================
@@ -136,6 +146,7 @@ _REF_RE = re.compile(r"^[A-Za-z0-9:_\-.|]{1,128}$")
 _INCIDENT_RE = re.compile(r"^INC[0-9]{7,10}$")
 _REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 _CONVERSATION_REF_RE = re.compile(r"^[0-9a-f]{16}$")
+_ARTICLE_ID_RE = re.compile(r"^KB[0-9]{7}$")
 
 
 def safe_ref(value: Any) -> Optional[str]:
@@ -200,6 +211,8 @@ class AuditEvent:
     incident_number: Optional[str] = None
     tool: Optional[str] = None
     reason: Optional[str] = None
+    result_count: Optional[int] = None
+    article_ids: tuple[str, ...] = ()
     timestamp: str = field(default_factory=_utc_now)
 
     def __post_init__(self) -> None:
@@ -222,10 +235,19 @@ class AuditEvent:
         _check("reason", self.reason, _REASON_RE)
         if self.tool is not None and self.tool not in AUDIT_TOOLS:
             raise ValueError("audit tool must be a known gateway tool")
+        if self.result_count is not None and (
+            isinstance(self.result_count, bool) or not isinstance(self.result_count, int)
+            or not 0 <= self.result_count <= 100
+        ):
+            raise ValueError("audit result_count must be a small non-negative integer")
+        if not isinstance(self.article_ids, tuple) or len(self.article_ids) > MAX_AUDIT_ARTICLES \
+                or not all(isinstance(a, str) and _ARTICLE_ID_RE.fullmatch(a)
+                           for a in self.article_ids):
+            raise ValueError("audit article_ids must be knowledge article identifiers")
         if not isinstance(self.timestamp, str) or not self.timestamp:
             raise ValueError("audit timestamp is required")
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         """Structured form; absent optional fields are omitted."""
         data = {
             "timestamp": self.timestamp,
@@ -240,6 +262,8 @@ class AuditEvent:
             "incident_number": self.incident_number,
             "tool": self.tool,
             "reason": self.reason,
+            "result_count": self.result_count,
+            "article_ids": list(self.article_ids) or None,
         }
         return {k: v for k, v in data.items() if v is not None}
 
