@@ -896,6 +896,103 @@ and all SQL is fixed and parameterised.
 
 ---
 
+## DEMO-02 — ServiceNow Resilience
+
+Every ServiceNow failure is classified, reported with a fixed message, never
+retried, and never reported as success. The Tool Gateway stays the only path
+to ServiceNow, and the LLM cannot reach it.
+
+```
+ServiceNowClient (app/servicenow.py)       httpx / HTTP outcome → typed ServiceNowError
+      │   category + possibly_applied            (fixed text; no body, URL, header or token)
+      ▼
+ServiceNowToolGateway (app/tools/)          → ToolResult(success=False, error_code=<category>,
+      │                                                  safe_message, outcome_unknown)
+      ▼
+app/main.py                                  → Teams reply, FAILED state, audit + observability
+```
+
+### Failure categories (`app/servicenow_errors.py`)
+
+| Category (`error_code`) | Source | Write outcome |
+|---|---|---|
+| `SERVICENOW_UNAVAILABLE` | connect error / connect or pool timeout; HTTP 503 | not applied |
+| ″ | connection lost after a write was sent | **unconfirmed** |
+| `SERVICENOW_TIMEOUT` | read/write timeout after the request was sent | **unconfirmed** (write) |
+| `SERVICENOW_AUTH_FAILED` | OAuth failure (400/401/403, bad token response); API 401 | not applied |
+| `SERVICENOW_FORBIDDEN` | API 403 (integration user lacks rights) | not applied |
+| `NOT_FOUND` | 404 / empty lookup | not applied |
+| `SERVICENOW_REJECTED` | 400 and other 4xx | not applied |
+| `SERVICENOW_RATE_LIMITED` | 429 | not applied |
+| `SERVICENOW_SERVER_ERROR` | 500 / 502 / 504 / other 5xx | **unconfirmed** (write) |
+| `SERVICENOW_INVALID_RESPONSE` | 2xx body not JSON / wrong shape; invalid `sys_id` | **unconfirmed** if the write returned it |
+
+- **Not applied** means the user is told "No change was made."
+- **Unconfirmed** (`outcome_unknown`) means the write may have happened. The
+  user is told it "couldn't confirm whether the incident was created / was
+  updated", to check before trying again, and that it won't retry
+  automatically. It is never phrased as "not created" and never as success.
+- OAuth failures happen before any business request, so they never make a
+  write unconfirmed.
+- An update's current-value lookup fails before the `PATCH` is sent, so it is
+  always "not applied". A `sys_id` that is not 32 hex characters stops the
+  update before a URL is built.
+- A 401 clears the cached token, so the next request re-authenticates. The
+  failed request itself is not retried.
+- Timeouts: connect 10 s, everything else 30 s.
+- Unclassified errors (for example a pre-send `ServiceNowError`, or an
+  unexpected gateway exception) keep the existing `EXECUTION_ERROR` contract
+  and messages.
+
+### Retry policy
+
+Nothing is retried automatically: not create, not update, not reads. A failed
+create/update moves to `FAILED`, and a further "yes" cannot re-execute it
+(BL-007 / BL-009). The user must start a new request, which goes through
+collection, confirmation and authorization again.
+
+### User-facing messages
+
+The messages are fixed text built only from the category, the operation and
+a validated incident number. Examples:
+
+- "I couldn't reach ServiceNow right now. No change was made. Please try again."
+- "I couldn't find incident INC0010002."
+- "The ServiceNow integration is temporarily unavailable. No change was made."
+- "ServiceNow is temporarily rate-limiting requests. Please try again shortly."
+- "ServiceNow didn't respond in time. I couldn't confirm whether the incident
+  was created. Please check your incidents in ServiceNow before trying again.
+  I won't retry automatically."
+
+Status-lookup failures return a message and never touch conversation state.
+Persistence failures (DEMO-01) keep their own distinct message, and the
+ServiceNow category is still audited before the state save.
+
+### Audit and observability
+
+- Audit `*_FAILED` `reason` is the category in lower case (for example
+  `servicenow_timeout`), with `_unconfirmed` appended when a write may have
+  been applied. BL-011 `tool_failed.error_code` uses the same value.
+- `last_error` (persisted) holds the fixed message only.
+- Client warnings log the category, HTTP status and `possibly_applied`, never
+  the URL.
+- `httpx` request logging (which includes the instance URL and query) is
+  filtered below WARNING. A filter is used because the Teams SDK resets the
+  `httpx` logger level.
+
+### Limitations (POC)
+
+- A 503 on a write is treated as "not applied", on the assumption that
+  ServiceNow refuses the request without processing it (maintenance or a
+  hibernating instance). A proxy that returns 503 after forwarding would
+  break that assumption.
+- There is no automatic reconciliation of unconfirmed creates. The user (or
+  IT) checks ServiceNow. A future version could look up a
+  correlation-tagged incident.
+- `Retry-After` on 429 is not surfaced. The message says "shortly".
+
+---
+
 ## Security Notes (all layers)
 
 - Credentials are read from the environment (`.env` / OS env); never

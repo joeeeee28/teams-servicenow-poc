@@ -1,11 +1,18 @@
+import json
 import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from dotenv import load_dotenv
+
+from app.servicenow_errors import (
+    ServiceNowErrorCategory,
+    category_for_status,
+    write_possibly_applied,
+)
 
 load_dotenv()
 
@@ -13,12 +20,102 @@ logger = logging.getLogger(__name__)
 
 
 class ServiceNowError(Exception):
-    pass
+    """
+    ServiceNow transport failure.
+
+    DEMO-02: ``category`` classifies the failure (``None`` = unclassified).
+    ``possibly_applied`` is True only when a write request was sent and its
+    outcome could not be confirmed.  Messages are fixed text — never response
+    bodies, URLs, headers or tokens.
+    """
+
+    category: Optional[ServiceNowErrorCategory] = None
+
+    def __init__(
+        self,
+        message: str = "ServiceNow request failed",
+        *,
+        category: Optional[ServiceNowErrorCategory] = None,
+        possibly_applied: bool = False,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        if category is not None:
+            self.category = category
+        self.possibly_applied = possibly_applied
+        self.status_code = status_code
 
 
 class ServiceNowNotFound(ServiceNowError):
     """Raised when the requested incident does not exist in ServiceNow."""
-    pass
+
+    category = ServiceNowErrorCategory.NOT_FOUND
+
+
+class ServiceNowUnavailable(ServiceNowError):
+    category = ServiceNowErrorCategory.UNAVAILABLE
+
+
+class ServiceNowTimeout(ServiceNowError):
+    category = ServiceNowErrorCategory.TIMEOUT
+
+
+class ServiceNowAuthError(ServiceNowError):
+    category = ServiceNowErrorCategory.AUTH_FAILED
+
+
+class ServiceNowForbidden(ServiceNowError):
+    category = ServiceNowErrorCategory.FORBIDDEN
+
+
+class ServiceNowRejected(ServiceNowError):
+    category = ServiceNowErrorCategory.REJECTED
+
+
+class ServiceNowRateLimited(ServiceNowError):
+    category = ServiceNowErrorCategory.RATE_LIMITED
+
+
+class ServiceNowServerError(ServiceNowError):
+    category = ServiceNowErrorCategory.SERVER_ERROR
+
+
+class ServiceNowInvalidResponse(ServiceNowError):
+    category = ServiceNowErrorCategory.INVALID_RESPONSE
+
+
+_ERROR_CLASSES: dict[ServiceNowErrorCategory, type[ServiceNowError]] = {
+    cls.category: cls
+    for cls in (ServiceNowNotFound, ServiceNowUnavailable, ServiceNowTimeout,
+                ServiceNowAuthError, ServiceNowForbidden, ServiceNowRejected,
+                ServiceNowRateLimited, ServiceNowServerError, ServiceNowInvalidResponse)
+}
+
+# Connect 10 s (unreachable instance fails fast), everything else 30 s.
+DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+_SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _http_error(status_code: int, *, what: str, write_sent: bool) -> ServiceNowError:
+    category = category_for_status(status_code)
+    return _ERROR_CLASSES[category](
+        f"{what} failed: HTTP {status_code}",
+        possibly_applied=write_sent and write_possibly_applied(status_code),
+        status_code=status_code,
+    )
+
+
+def _transport_error(exc: httpx.HTTPError, *, what: str, write_sent: bool) -> ServiceNowError:
+    """
+    Classify an httpx failure.  Connection-phase failures mean the request
+    never reached ServiceNow; anything later leaves a write's outcome unknown.
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return ServiceNowUnavailable(f"{what} failed: could not connect")
+    if isinstance(exc, httpx.TimeoutException):
+        return ServiceNowTimeout(f"{what} failed: timed out", possibly_applied=write_sent)
+    return ServiceNowUnavailable(f"{what} failed: connection error", possibly_applied=write_sent)
 
 
 # Incident numbers must be INC followed by exactly 7 to 10 digits.
@@ -64,6 +161,16 @@ class ServiceNowClient:
         self._access_token: str | None = None
         self._token_expires_at: float = 0
 
+        # Test seam only: an httpx transport (e.g. MockTransport).
+        self._transport: httpx.AsyncBaseTransport | None = None
+
+    def _http(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, transport=self._transport)
+
+    def _invalidate_token(self) -> None:
+        self._access_token = None
+        self._token_expires_at = 0
+
     async def _get_access_token(self) -> str:
         """
         Get a ServiceNow OAuth access token using
@@ -85,24 +192,46 @@ class ServiceNowClient:
             "client_secret": self.client_secret,
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                token_url,
-                data=data,
-            )
+        # Token failures happen before any business request is sent, so they
+        # can never leave a write half-done (possibly_applied=False).
+        try:
+            async with self._http() as client:
+                response = await client.post(
+                    token_url,
+                    data=data,
+                )
+        except httpx.HTTPError as exc:
+            error = _transport_error(exc, what="ServiceNow OAuth", write_sent=False)
+            logger.warning("servicenow oauth: %s", error.category.value)
+            raise error from None
 
         if response.status_code != 200:
-            raise ServiceNowError(
-                f"ServiceNow OAuth failed: HTTP {response.status_code}"
-            )
+            status = response.status_code
+            if status in (400, 401, 403):
+                # Rejected credentials are an integration/configuration problem.
+                error = ServiceNowAuthError(f"ServiceNow OAuth failed: HTTP {status}",
+                                            status_code=status)
+            else:
+                error = _http_error(status, what="ServiceNow OAuth", write_sent=False)
+            logger.warning("servicenow oauth: %s status=%d", error.category.value, status)
+            raise error
 
-        token_data = response.json()
+        try:
+            token_data = response.json()
+        except ValueError:
+            raise ServiceNowAuthError("ServiceNow OAuth response was not valid JSON") from None
+
+        if not isinstance(token_data, dict):
+            raise ServiceNowAuthError("ServiceNow OAuth response was not an object")
 
         access_token = token_data.get("access_token")
-        expires_in = int(token_data.get("expires_in", 1800))
+        try:
+            expires_in = int(token_data.get("expires_in", 1800))
+        except (TypeError, ValueError):
+            expires_in = 1800
 
-        if not access_token:
-            raise ServiceNowError(
+        if not access_token or not isinstance(access_token, str):
+            raise ServiceNowAuthError(
                 "ServiceNow OAuth response did not contain an access token"
             )
 
@@ -119,10 +248,16 @@ class ServiceNowClient:
         self,
         method: str,
         url: str,
+        *,
+        write: bool = False,
         **kwargs: Any,
     ) -> dict:
         """
         Make an authenticated ServiceNow API request.
+
+        DEMO-02: every failure is raised as a classified ``ServiceNowError``.
+        *write* marks a side-effecting request, so failures after it was sent
+        carry ``possibly_applied=True``.  Never retried here.
         """
 
         access_token = await self._get_access_token()
@@ -137,20 +272,49 @@ class ServiceNowClient:
             }
         )
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.request(
-                method,
-                url,
-                headers=headers,
-                **kwargs,
-            )
+        try:
+            async with self._http() as client:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    **kwargs,
+                )
+        except httpx.HTTPError as exc:
+            error = _transport_error(exc, what="ServiceNow API", write_sent=write)
+            logger.warning("servicenow %s: %s possibly_applied=%s",
+                           method, error.category.value, error.possibly_applied)
+            raise error from None
 
         if response.status_code >= 400:
-            raise ServiceNowError(
-                f"ServiceNow API failed: HTTP {response.status_code}"
-            )
+            if response.status_code == 401:
+                # Force a fresh token next time; this request is not retried.
+                self._invalidate_token()
+            error = _http_error(response.status_code, what="ServiceNow API", write_sent=write)
+            logger.warning("servicenow %s: %s status=%d possibly_applied=%s",
+                           method, error.category.value, response.status_code,
+                           error.possibly_applied)
+            raise error
 
-        return response.json()
+        try:
+            body = response.json()
+        except (ValueError, json.JSONDecodeError):
+            body = None
+        if not isinstance(body, dict):
+            logger.warning("servicenow %s: %s possibly_applied=%s", method,
+                           ServiceNowErrorCategory.INVALID_RESPONSE.value, write)
+            raise ServiceNowInvalidResponse("ServiceNow API returned an unexpected body",
+                                            possibly_applied=write)
+        return body
+
+    @staticmethod
+    def _record(body: dict, *, write: bool) -> dict:
+        """The ``result`` object of a create/update response."""
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise ServiceNowInvalidResponse("ServiceNow API result was not an object",
+                                            possibly_applied=write)
+        return result
 
     async def create_incident(
         self,
@@ -175,10 +339,11 @@ class ServiceNowClient:
         response = await self._request(
             "POST",
             url,
+            write=True,
             json=payload,
         )
 
-        return response["result"]
+        return self._record(response, write=True)
 
     async def get_incident(
         self,
@@ -209,10 +374,16 @@ class ServiceNowClient:
 
         results = response.get("result", [])
 
+        if not isinstance(results, list):
+            raise ServiceNowInvalidResponse("ServiceNow lookup result was not a list")
+
         if not results:
             raise ServiceNowNotFound(
                 "The requested incident was not found."
             )
+
+        if not isinstance(results[0], dict):
+            raise ServiceNowInvalidResponse("ServiceNow lookup record was not an object")
 
         return results[0]
 
@@ -254,7 +425,11 @@ class ServiceNowClient:
         # value so no double-normalisation ambiguity exists.
         incident = await self.get_incident(normalised)
 
-        sys_id = incident["sys_id"]
+        # The sys_id comes from ServiceNow; it must be a plain 32-hex id
+        # before it is placed in a URL path.  Nothing has been written yet.
+        sys_id = incident.get("sys_id")
+        if not isinstance(sys_id, str) or not _SYS_ID_RE.fullmatch(sys_id):
+            raise ServiceNowInvalidResponse("ServiceNow lookup returned an invalid sys_id")
 
         url = (
             f"{self.instance}/api/now/table/incident/{sys_id}"
@@ -263,7 +438,8 @@ class ServiceNowClient:
         response = await self._request(
             "PATCH",
             url,
+            write=True,
             json=payload,
         )
 
-        return response["result"]
+        return self._record(response, write=True)

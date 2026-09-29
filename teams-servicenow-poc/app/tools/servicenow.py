@@ -12,6 +12,9 @@ The gateway guarantees:
   3. Strict authorization enforcement (consumes app.security.authorization.authorize()).
   4. Action matching (prevents authorization/tool action mismatch).
   5. Safe error handling (never exposes OAuth tokens, headers, stack traces, or internal details).
+  6. DEMO-02: classified ServiceNow failures (``ServiceNowErrorCategory``) with
+     fixed user-facing messages, and ``outcome_unknown`` when a create/update
+     may have been applied but could not be confirmed.  Nothing is retried.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import app.observability as _obs
 from app.security.authorization import AuthorizableAction, AuthorizationDecision
 from app.security.identity import UserIdentity
 from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
+from app.servicenow_errors import ServiceNowErrorCategory, failure_message
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,39 @@ class ToolExecutionError(ToolGatewayError):
 
     def __init__(self, message: str = "ServiceNow execution failed"):
         super().__init__(message, error_code="EXECUTION_ERROR")
+
+
+class ToolServiceNowError(ToolGatewayError):
+    """
+    DEMO-02: a classified ServiceNow failure.  ``error_code`` is the category
+    value; ``message`` is the fixed user-facing text for it.
+    """
+
+    def __init__(
+        self,
+        category: ServiceNowErrorCategory,
+        message: str,
+        *,
+        outcome_unknown: bool = False,
+    ):
+        super().__init__(message, error_code=category.value)
+        self.category = category
+        self.outcome_unknown = outcome_unknown
+
+
+def _servicenow_failure(exc: ServiceNowError, *, operation: str,
+                        incident_number: Optional[str] = None) -> Optional[ToolServiceNowError]:
+    """Map a classified transport failure to a gateway error (None if unclassified)."""
+    category = getattr(exc, "category", None)
+    if not isinstance(category, ServiceNowErrorCategory):
+        return None
+    possibly_applied = operation != "read" and bool(getattr(exc, "possibly_applied", False))
+    return ToolServiceNowError(
+        category,
+        failure_message(category, operation=operation, possibly_applied=possibly_applied,
+                        incident_number=incident_number),
+        outcome_unknown=possibly_applied,
+    )
 
 
 # ===========================================================================
@@ -281,6 +318,9 @@ class ToolResult:
     incident: Optional[dict[str, Any]] = None
     safe_message: str = ""
     error_code: Optional[str] = None
+    outcome_unknown: bool = False
+    """DEMO-02: True when a create/update may have been applied but could not
+    be confirmed.  Such a result is still a failure — never a success."""
 
     @classmethod
     def ok(
@@ -306,6 +346,7 @@ class ToolResult:
         action: ServiceNowToolAction,
         safe_message: str,
         error_code: str,
+        outcome_unknown: bool = False,
     ) -> ToolResult:
         """Construct a failed ToolResult."""
         return cls(
@@ -315,6 +356,7 @@ class ToolResult:
             incident=None,
             safe_message=safe_message,
             error_code=error_code,
+            outcome_unknown=outcome_unknown,
         )
 
 
@@ -325,6 +367,12 @@ def _failure_outcome(error_code: Optional[str]):
     if error_code == "VALIDATION_ERROR":
         return _obs.ObsOutcome.REJECTED
     return _obs.ObsOutcome.FAILED
+
+
+def _obs_error_code(error_code: Optional[str], outcome_unknown: bool) -> str:
+    """BL-011 error_code: the failure category, ``_unconfirmed`` if a write may have applied."""
+    code = (error_code or "execution_error").lower()
+    return code + "_unconfirmed" if outcome_unknown else code
 
 
 # ===========================================================================
@@ -393,7 +441,9 @@ class ServiceNowToolGateway:
         except ToolGatewayError as err:
             self._observe_tool(_obs.ObsEventName.TOOL_FAILED, _failure_outcome(err.error_code),
                                identity, tool_action, correlation_id,
-                               error_code=err.error_code.lower(), duration_ms=_obs.elapsed_ms(started))
+                               error_code=_obs_error_code(err.error_code,
+                                                          getattr(err, "outcome_unknown", False)),
+                               duration_ms=_obs.elapsed_ms(started))
             raise
         if result.success:
             self._observe_tool(_obs.ObsEventName.TOOL_COMPLETED, _obs.ObsOutcome.SUCCESS,
@@ -402,7 +452,7 @@ class ServiceNowToolGateway:
         else:
             self._observe_tool(_obs.ObsEventName.TOOL_FAILED, _failure_outcome(result.error_code),
                                identity, tool_action, correlation_id,
-                               error_code=(result.error_code or "execution_error").lower(),
+                               error_code=_obs_error_code(result.error_code, result.outcome_unknown),
                                duration_ms=_obs.elapsed_ms(started))
         return result
 
@@ -507,6 +557,7 @@ class ServiceNowToolGateway:
                 action=tool_action if isinstance(tool_action, ServiceNowToolAction) else ServiceNowToolAction.GET_INCIDENT,
                 safe_message=err.message,
                 error_code=err.error_code,
+                outcome_unknown=getattr(err, "outcome_unknown", False),
             )
 
         except Exception as exc:
@@ -580,7 +631,8 @@ class ServiceNowToolGateway:
         except ServiceNowNotFound:
             raise ToolNotFoundError(f"Incident {normalised_num} was not found.")
         except ServiceNowError as exc:
-            raise ToolExecutionError("Failed to retrieve incident from ServiceNow.") from exc
+            raise (_servicenow_failure(exc, operation="read", incident_number=normalised_num)
+                   or ToolExecutionError("Failed to retrieve incident from ServiceNow.")) from None
 
     async def _execute_create_incident(
         self,
@@ -617,7 +669,9 @@ class ServiceNowToolGateway:
                 incident=incident,
             )
         except ServiceNowError as exc:
-            raise ToolExecutionError("Failed to create incident in ServiceNow.") from exc
+            # Never retried: a create is not idempotent.
+            raise (_servicenow_failure(exc, operation="create")
+                   or ToolExecutionError("Failed to create incident in ServiceNow.")) from None
 
     async def _execute_update_incident(
         self,
@@ -646,4 +700,6 @@ class ServiceNowToolGateway:
         except ServiceNowNotFound:
             raise ToolNotFoundError(f"Incident {normalised_num} was not found.")
         except ServiceNowError as exc:
-            raise ToolExecutionError("Failed to update incident in ServiceNow.") from exc
+            # Never retried: a repeated update could apply twice.
+            raise (_servicenow_failure(exc, operation="update", incident_number=normalised_num)
+                   or ToolExecutionError("Failed to update incident in ServiceNow.")) from None

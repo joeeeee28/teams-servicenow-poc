@@ -52,6 +52,7 @@ from app.incident_update import (
     validated_update,
 )
 from app.router import route_message
+from app.servicenow_errors import CATEGORY_CODES
 from app.security.authorization import AuthorizableAction, authorize
 from app.security import identity as _identity_module
 from app.security.identity import ANONYMOUS, resolve_identity
@@ -81,6 +82,19 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+
+class _WarningsOnly(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING
+
+
+# DEMO-02: httpx logs every request (full ServiceNow instance URL and query)
+# at INFO.  Internal URLs must not reach the logs; failures are logged by
+# app.servicenow as categories instead.  A filter is used because the Teams
+# SDK resets the httpx logger level when it creates its HTTP client.
+logging.getLogger("httpx").addFilter(_WarningsOnly())
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -660,11 +674,52 @@ def _audit_session(event_type, context, session, **fields) -> None:
     _audit(event_type, context, correlation_id=session.correlation_id, **fields)
 
 
+_KNOWN_FAILURE_REASONS = frozenset(
+    {"not_found", "execution_error", "validation_error", "authorization_denied"}
+    | {code.lower() for code in CATEGORY_CODES}
+)
+
+
 def _failure_reason(tool_result) -> str:
+    """
+    Audit reason for a failed tool result.  DEMO-02: the ServiceNow failure
+    category, suffixed ``_unconfirmed`` when a write may have been applied.
+    """
     code = (tool_result.error_code or "execution_error").lower()
-    return code if code in (
-        "not_found", "execution_error", "validation_error", "authorization_denied",
-    ) else "execution_error"
+    reason = code if code in _KNOWN_FAILURE_REASONS else "execution_error"
+    if getattr(tool_result, "outcome_unknown", False):
+        reason += "_unconfirmed"
+    return reason
+
+
+def _classified(tool_result) -> bool:
+    """
+    DEMO-02: a categorized ServiceNow failure whose safe_message is the reply.
+    NOT_FOUND for a read/update keeps its existing incident-specific reply; a
+    404 on create has no target incident and is reported as a category.
+    """
+    if tool_result.error_code not in CATEGORY_CODES:
+        return False
+    return (tool_result.error_code != "NOT_FOUND"
+            or tool_result.action is ServiceNowToolAction.CREATE_INCIDENT)
+
+
+def _read_failure_reply(tool_result, incident_number: str) -> str:
+    if tool_result.error_code == "NOT_FOUND":
+        return not_found_message(incident_number)
+    if _classified(tool_result):
+        return tool_result.safe_message
+    return lookup_failed_message(incident_number)
+
+
+def _write_failure_reply(tool_result, legacy: str) -> str:
+    """
+    Reply for a failed create/update.  An unconfirmed outcome is never
+    reported as "could not be created/applied": the write may have happened.
+    """
+    if _classified(tool_result):
+        return ("⚠️ " if tool_result.outcome_unknown else "❌ ") + tool_result.safe_message
+    return legacy
 
 
 # ============================================================
@@ -816,11 +871,12 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
     )
     save_session(_state_key(context.activity), session)
 
-    await context.send(
+    await context.send(_write_failure_reply(
+        tool_result,
         f"❌ The incident could not be created: {tool_result.safe_message}\n\n"
         "It will not be retried automatically. You can start a new "
-        "incident request if needed."
-    )
+        "incident request if needed.",
+    ))
 
 
 # ============================================================
@@ -887,10 +943,7 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
         **read,
     )
 
-    if tool_result.error_code == "NOT_FOUND":
-        return not_found_message(incident_number)
-
-    return lookup_failed_message(incident_number)
+    return _read_failure_reply(tool_result, incident_number)
 
 
 # ============================================================
@@ -984,9 +1037,7 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
             reason=_failure_reason(read_result) if not read_result.success else "empty_result",
             **read,
         )
-        if read_result.error_code == "NOT_FOUND":
-            return not_found_message(number)
-        return lookup_failed_message(number)
+        return _read_failure_reply(read_result, number)
     _audit(AuditEventType.INCIDENT_READ_COMPLETED, context, **read)
 
     # The read above awaited, so another message may have changed this
@@ -1145,11 +1196,12 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
     )
     save_session(_state_key(context.activity), session)
 
-    await context.send(
+    await context.send(_write_failure_reply(
+        tool_result,
         f"❌ The update to {number} could not be applied: "
         f"{tool_result.safe_message}\n\n"
-        "It will not be retried automatically."
-    )
+        "It will not be retried automatically.",
+    ))
 
 
 # ============================================================
