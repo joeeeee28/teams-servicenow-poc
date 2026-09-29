@@ -517,6 +517,47 @@ or credentials, and it logs field names only, never message content.
 
 ---
 
+## BL-007 — Incident Confirmation & Creation
+
+`_create_confirmed_incident()` in `app/main.py` runs when the BL-003 gate
+returns `confirmed=True` for a conversation in `READY_FOR_CONFIRMATION`.
+
+```
+READY_FOR_CONFIRMATION + explicit confirmation (BL-003)
+   │
+   ├─ collected details incomplete/invalid ─► CANCELLED ─► IDLE   (nothing executed)
+   │
+   ├─ resolve_identity → authorize(CREATE_INCIDENT)
+   │      └─ denied ─► stays READY_FOR_CONFIRMATION           (nothing executed)
+   │
+   ▼
+EXECUTING  (saved before the side effect)
+   │
+   ▼
+ServiceNowToolGateway.execute(CREATE_INCIDENT)    ← called exactly once
+   ├─ success ─► COMPLETED  (incident_number stored and shown)
+   └─ failure ─► FAILED     (last_error = gateway safe_message)
+```
+
+- **No defaults.** The request is built with
+  `CreateIncidentToolRequest(**validate_incident_payload(collected_details))`,
+  which uses exactly `short_description`, `description`, `impact` and
+  `urgency`. Missing or out-of-contract values stop the workflow before
+  identity, authorization or execution. The LLM `summary` is never used.
+- **Gateway only.** The handler never calls `ServiceNowClient` directly.
+  If `execute()` raises unexpectedly, the error is converted to a safe
+  failure (`FAILED`), so the conversation never stays in `EXECUTING`.
+- **No false success.** Success is reported only when the gateway returns
+  `success=True`. If ServiceNow returns no incident number, the user is
+  told so and asked not to resubmit.
+- **No retry and no duplicates.** CREATE is attempted once. Messages that
+  arrive while `EXECUTING` get a "still being created" reply without
+  reaching the LLM or the gateway. After `COMPLETED` or `FAILED`, "yes" is
+  no longer a confirmation, because the gate requires
+  `READY_FOR_CONFIRMATION`. A new incident needs a new BL-006 collection.
+
+---
+
 ## Security Notes (all layers)
 
 - Credentials are read from the environment (`.env` / OS env); never

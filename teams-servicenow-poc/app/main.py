@@ -19,8 +19,10 @@ from app.servicenow import (
 )
 from app.confirmation import ConfirmationDecision, evaluate_confirmation
 from app.incident_collection import (
+    CREATE_INCIDENT_ACTION,
     process_collection_message,
     start_incident_collection,
+    validate_incident_payload,
 )
 from app.security.authorization import AuthorizableAction, authorize
 from app.security.identity import ANONYMOUS, resolve_identity
@@ -28,6 +30,7 @@ from app.tools import (
     CreateIncidentToolRequest,
     ServiceNowToolAction,
     ServiceNowToolGateway,
+    ToolResult,
 )
 from app.state import (
     ConversationPhase,
@@ -198,71 +201,8 @@ async def on_message(context):
             decision = evaluate_confirmation(session, user_message)
 
             if decision.confirmed:
-                # ── BL-004: resolve identity and authorize before EXECUTING ──
-                # BL-005 will call authorize() here and then invoke the tool.
-                # Identity is resolved from the same activity the message
-                # arrived on; Teams authentication has already validated it.
-                _identity = resolve_identity(
-                    context.activity,
-                    channel_tenant_id=(
-                        (getattr(context.activity, "channel_data", None) or {})
-                        .get("tenant", {}).get("id", "")
-                    ),
-                )
-                _authz = authorize(
-                    _identity,
-                    AuthorizableAction.CREATE_INCIDENT,
-                )
-
-                if not _authz.allowed:
-                    logger.warning(
-                        "authorization denied for user=%r action=%r",
-                        _identity.user_id,
-                        AuthorizableAction.CREATE_INCIDENT.value,
-                    )
-                    await context.send(
-                        "⛔ You are not authorised to perform this action.\n\n"
-                        "Please contact your IT administrator if you believe "
-                        "this is incorrect."
-                    )
-                    return
-
-                # Transition to EXECUTING phase.
-                session.transition_to(ConversationPhase.EXECUTING)
-                save_session(user_id, session)
-
-                # ── BL-005: Execute via ServiceNow Tool Gateway ────────────────
-                tool_request = CreateIncidentToolRequest(
-                    short_description=session.summary or "Service Desk Incident Request",
-                    description=session.collected_details.get("description", session.summary or ""),
-                    impact=session.collected_details.get("impact", "3"),
-                    urgency=session.collected_details.get("urgency", "3"),
-                )
-                tool_result = await servicenow_gateway.execute(
-                    _identity,
-                    _authz,
-                    ServiceNowToolAction.CREATE_INCIDENT,
-                    tool_request,
-                )
-
-                if tool_result.success:
-                    session.incident_number = tool_result.incident_number
-                    session.transition_to(ConversationPhase.COMPLETED)
-                    save_session(user_id, session)
-
-                    await context.send(
-                        f"✅ Incident **{tool_result.incident_number}** has been "
-                        f"created successfully.\n\n"
-                        f"**Summary:** {session.summary or ''}"
-                    )
-                else:
-                    session.last_error = tool_result.safe_message
-                    session.transition_to(ConversationPhase.FAILED)
-                    save_session(user_id, session)
-
-                    await context.send(
-                        f"❌ Failed to create incident: {tool_result.safe_message}"
-                    )
+                # BL-007: validate → authorize → EXECUTING → Tool Gateway.
+                await _create_confirmed_incident(context, user_id, session)
                 return
 
             elif decision.cancelled:
@@ -286,6 +226,22 @@ async def on_message(context):
                     "cancel."
                 )
                 return
+
+
+        # ----------------------------------------------------
+        # BL-007: a create is in flight.  Never re-enter the
+        # workflow (or the LLM) while EXECUTING — this prevents a
+        # second message from producing a duplicate incident.
+        # ----------------------------------------------------
+
+        if session.phase is ConversationPhase.EXECUTING:
+
+            await context.send(
+                "⏳ Your incident is still being created. "
+                "Please wait for the result before sending another request."
+            )
+
+            return
 
 
         # ----------------------------------------------------
@@ -414,6 +370,131 @@ async def on_message(context):
             "I'm having trouble understanding your request right now. "
             "Please try again."
         )
+
+
+# ============================================================
+# BL-007: CONFIRMED INCIDENT CREATION
+# ============================================================
+
+def _channel_tenant_id(activity) -> str:
+    """Tenant ID asserted in Bot Framework channel data ("" if absent)."""
+    channel_data = getattr(activity, "channel_data", None)
+    if isinstance(channel_data, dict):
+        tenant = channel_data.get("tenant")
+        return (tenant.get("id", "") if isinstance(tenant, dict) else "") or ""
+    tenant = getattr(channel_data, "tenant", None)
+    return getattr(tenant, "id", "") or ""
+
+
+async def _create_confirmed_incident(context, user_id: str, session) -> None:
+    """
+    Execute a create_incident the user has explicitly confirmed (BL-003).
+
+    Order: validate collected details → resolve identity → authorize
+    CREATE_INCIDENT → READY_FOR_CONFIRMATION → EXECUTING → Tool Gateway
+    (exactly once, never retried) → COMPLETED or FAILED.
+
+    Nothing is defaulted: incomplete or invalid details stop the workflow
+    before any side effect.
+    """
+
+    # -- Collected details must be complete and valid (no defaults) --------
+    try:
+        if session.pending_action != CREATE_INCIDENT_ACTION:
+            raise ValueError("pending action is not create_incident")
+        payload = validate_incident_payload(session.collected_details)
+    except ValueError:
+        logger.warning(
+            "incident creation blocked: collected details incomplete or invalid "
+            "for user=%r",
+            user_id,
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(user_id, session)
+
+        await context.send(
+            "⚠️ Some incident details are missing or invalid, so no incident "
+            "was created.\n\n"
+            "Please start a new incident request."
+        )
+        return
+
+    # -- BL-004: identity and authorization ------------------------------
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    authz = authorize(identity, AuthorizableAction.CREATE_INCIDENT)
+
+    if not authz.allowed:
+        logger.warning(
+            "authorization denied for user=%r action=%r",
+            identity.user_id,
+            AuthorizableAction.CREATE_INCIDENT.value,
+        )
+        await context.send(
+            "⛔ You are not authorised to perform this action.\n\n"
+            "Please contact your IT administrator if you believe "
+            "this is incorrect."
+        )
+        return
+
+    tool_request = CreateIncidentToolRequest(**payload)
+
+    # -- EXECUTING is persisted BEFORE the side effect ---------------------
+    session.transition_to(ConversationPhase.EXECUTING)
+    save_session(user_id, session)
+
+    # -- BL-005: single gateway call — CREATE is never retried ------------
+    try:
+        tool_result = await servicenow_gateway.execute(
+            identity,
+            authz,
+            ServiceNowToolAction.CREATE_INCIDENT,
+            tool_request,
+        )
+    except Exception as exc:
+        logger.error(
+            "incident creation: gateway raised %s for user=%r",
+            type(exc).__name__,
+            user_id,
+        )
+        tool_result = ToolResult.fail(
+            action=ServiceNowToolAction.CREATE_INCIDENT,
+            safe_message="A ServiceNow error occurred while creating the incident.",
+            error_code="EXECUTION_ERROR",
+        )
+
+    if tool_result.success:
+        session.incident_number = tool_result.incident_number or None
+        session.transition_to(ConversationPhase.COMPLETED)
+        save_session(user_id, session)
+
+        if session.incident_number:
+            await context.send(
+                f"✅ Incident **{session.incident_number}** has been "
+                f"created successfully.\n\n"
+                f"**Short description:** {payload['short_description']}"
+            )
+        else:
+            await context.send(
+                "✅ ServiceNow reported the incident as created but did not "
+                "return an incident number.\n\n"
+                "Please do not submit it again — contact IT support to "
+                "confirm the incident number."
+            )
+        return
+
+    session.last_error = tool_result.safe_message
+    session.transition_to(ConversationPhase.FAILED)
+    save_session(user_id, session)
+
+    await context.send(
+        f"❌ The incident could not be created: {tool_result.safe_message}\n\n"
+        "It will not be retried automatically. You can start a new "
+        "incident request if needed."
+    )
 
 
 # ============================================================
