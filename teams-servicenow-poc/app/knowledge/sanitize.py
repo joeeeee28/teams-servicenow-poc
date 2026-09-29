@@ -119,6 +119,11 @@ def _clean(line: str) -> str:
     return line if len(line) <= MAX_LINE else line[: MAX_LINE - 1].rstrip() + "…"
 
 
+def contains_instructions(text: str) -> bool:
+    """True if *text* (raw or normalized) contains instruction-like content."""
+    return _any(INJECTION_PATTERNS, text) or _any(INJECTION_PATTERNS, _normalize(text))
+
+
 def _unsafe(text: str) -> bool:
     return (_any(SECRET_PATTERNS, text) or _any(INTERNAL_PATTERNS, text)
             or _any(PII_PATTERNS, text) or _any(INFRA_PATTERNS, text))

@@ -51,6 +51,15 @@ from app.incident_update import (
     unsupported_fields_message,
     validated_update,
 )
+from app.history import (
+    CaseOutcome,
+    CaseSearchRequest,
+    CaseSearchResult,
+    HistoricalCaseService,
+    LocalHistoricalCaseRepository,
+    format_history_answer,
+    is_history_question,
+)
 from app.knowledge import (
     KnowledgeOutcome,
     KnowledgeSearchRequest,
@@ -460,6 +469,18 @@ async def _handle_message(context):
 
 
         # ----------------------------------------------------
+        # DEMO-04: "have we seen this before?" — deterministic,
+        # read-only, no LLM, no ServiceNow, no state change.
+        # ----------------------------------------------------
+
+        if is_history_question(user_message):
+
+            await context.send(await _answer_history(context, user_message))
+
+            return
+
+
+        # ----------------------------------------------------
         # Ask Ollama to classify the current message
         # ----------------------------------------------------
 
@@ -790,6 +811,78 @@ async def _answer_knowledge(context, user_message: str) -> str:
             duration_ms=duration, **observe,
         )
     return format_knowledge_answer(result)
+
+
+# ============================================================
+# DEMO-04: HISTORICAL SIMILAR CASES (read-only, no side effects)
+# ============================================================
+
+history_service = HistoricalCaseService(LocalHistoricalCaseRepository.from_fixture())
+
+_NOT_AUTHORISED_HISTORY = (
+    "⛔ You are not authorised to search past cases.\n\n"
+    "Please contact your IT administrator if you believe this is incorrect."
+)
+
+
+async def _answer_history(context, user_message: str) -> str:
+    """
+    identity → authorize(READ_KNOWLEDGE) → HistoricalCaseService.search →
+    pattern summary citing case references.  Sanitized historical evidence is
+    governed like knowledge.  No ServiceNow call, no gateway, no state change,
+    no confirmation; audit / observability record references and counts only.
+    """
+    base = dict(
+        correlation_id=_audit_request_id(),
+        action=AuthorizableAction.READ_KNOWLEDGE,
+        tool="historical_case_search",
+    )
+    _audit(AuditEventType.HISTORICAL_CASE_SEARCH_REQUESTED, context, **base)
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    if not _authorize(identity, AuthorizableAction.READ_KNOWLEDGE).allowed:
+        _audit(AuditEventType.HISTORICAL_CASE_SEARCH_DENIED, context, **base)
+        return _NOT_AUTHORISED_HISTORY
+    _audit(AuditEventType.HISTORICAL_CASE_SEARCH_AUTHORIZED, context, **base)
+
+    observe = dict(
+        action=AuthorizableAction.READ_KNOWLEDGE,
+        operation="historical_case_search",
+        correlation_id=base["correlation_id"],
+    )
+    obs.observability.record(obs.ObsEventName.TOOL_STARTED, obs.ObsComponent.HISTORY,
+                             obs.ObsOutcome.STARTED, **observe)
+    started = time.monotonic()
+    try:
+        result = await history_service.search(CaseSearchRequest(user_message))
+    except Exception as exc:  # noqa: BLE001 — the service should never raise
+        logger.error("historical case search raised %s", type(exc).__name__)
+        result = CaseSearchResult(CaseOutcome.UNAVAILABLE)
+    duration = obs.elapsed_ms(started)
+
+    if result.outcome in (CaseOutcome.UNAVAILABLE, CaseOutcome.NEEDS_TOPIC):
+        unavailable = result.outcome is CaseOutcome.UNAVAILABLE
+        reason = "history_unavailable" if unavailable else "missing_topic"
+        _audit(AuditEventType.HISTORICAL_CASE_SEARCH_FAILED, context, reason=reason,
+               outcome=AuditOutcome.FAILED if unavailable else AuditOutcome.REJECTED, **base)
+        obs.observability.record(
+            obs.ObsEventName.TOOL_FAILED, obs.ObsComponent.HISTORY,
+            obs.ObsOutcome.FAILED if unavailable else obs.ObsOutcome.REJECTED,
+            error_code=reason, duration_ms=duration, **observe,
+        )
+    else:
+        _audit(AuditEventType.HISTORICAL_CASE_SEARCH_COMPLETED, context,
+               result_count=len(result.cases), case_refs=result.case_refs,
+               reason="content_withheld" if result.withheld else None, **base)
+        obs.observability.record(
+            obs.ObsEventName.TOOL_COMPLETED, obs.ObsComponent.HISTORY,
+            obs.ObsOutcome.SUCCESS, result_count=len(result.cases),
+            duration_ms=duration, **observe,
+        )
+    return format_history_answer(result)
 
 
 # ============================================================

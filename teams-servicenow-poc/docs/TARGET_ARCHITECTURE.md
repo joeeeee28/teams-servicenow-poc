@@ -24,6 +24,8 @@ FastAPI (app/main.py)
         │
         ├─► [DEMO-03] Knowledge (app/knowledge/) — read-only, no side effects
         │
+        ├─► [DEMO-04] Historical similar cases (app/history/) — read-only, no side effects
+        │
         ├─► Conversation State Machine (app/state.py)  ← BL-002
         │           │
         │           └─ ConversationState / StateRepository (StateKey)
@@ -1147,6 +1149,125 @@ are applied on top of that, without relying on the LLM:
   direction. False negatives are possible for secrets in unusual formats.
 - Knowledge is not tenant-scoped. BL-004 restricts use to the configured
   tenant.
+
+---
+
+## DEMO-04 — Historical Similar Cases
+
+Answers "Have we seen this issue before?" from sanitized, resolved historical
+cases. The answer summarizes the pattern of fixes and cites case
+references. It is read-only: no ServiceNow call, no Tool Gateway, no state
+change, no confirmation, and no LLM involvement at all.
+
+```
+Teams message ──► on_message (after COLLECTING / READY / EXECUTING handling
+   │               and the BL-001 router; before the LLM classifier)
+   ▼
+is_history_question (deterministic phrases; never a "create/raise/log … incident" request)
+   ▼
+_answer_history ── identity → authorize(READ_KNOWLEDGE) → audit / observability
+   ▼
+HistoricalCaseService ── CaseSearchRequest (user's words minus question words)
+   ▼
+HistoricalCaseRepository (interface) ── LocalHistoricalCaseRepository (POC, in memory)
+   ▼                                   └ future: curated ServiceNow export / allowlisted endpoint
+eligibility re-check → injection check on case text → CaseEvidence (controlled fields)
+   ▼
+format_history_answer: pattern of fixes + one cited line per case
+```
+
+### Data model (`app/history/models.py`)
+
+A `HistoricalCase` has two kinds of fields.
+
+- **Controlled fields** are the only ones that can be displayed: `case_ref`
+  (opaque `HC` + 5 digits), `category`, `symptoms` (`SymptomTag`) and
+  `resolution` (`ResolutionCode`). Each enum carries a fixed display label.
+- **Untrusted free text** (`description`, `resolution_notes`) is used for
+  matching only. It is never displayed, copied, logged or sent to the LLM.
+- **`private`** holds source-system fields (incident number, caller, e-mail,
+  phone, work notes, `sys_id`). They are never displayed, logged, matched or
+  returned.
+
+The source incident number is deliberately not shown. Historical cases may
+belong to other users, and showing their numbers would invite status
+lookups on someone else's incident.
+
+### Eligibility
+
+A case is used only if it is `resolved` or `closed`, explicitly marked
+`eligible`, **and** has a resolution code. The repository filters on this and
+the service checks it again. The POC fixture includes an in-progress case and
+a closed but ineligible case that are never returned.
+
+### Retrieval
+
+Retrieval uses the same tokenizer as DEMO-03. Question words ("have we seen
+… before", "similar", "cases", "issue"…) are removed first.
+
+- Score = 3 × symptom-keyword matches + 1 × free-text matches. A case must
+  match at least one symptom keyword.
+- Ties are broken by case reference, and the result is deterministic.
+- At most 5 cases are returned.
+- A question with no topic left ("Have we seen this before?") gets a request
+  for the issue. A topic with no match gets "I couldn't find a sufficiently
+  similar resolved case", plus an offer to create an incident. Nothing is
+  created automatically.
+
+### Answer, grounding and citations
+
+- The answer is built only from controlled labels: the most common
+  `ResolutionCode` among the retrieved cases ("most were resolved by … (k of
+  n)"), the other fixes, and one line per case:
+  `HC… — <category> · <symptom> · resolved by <fix>`.
+- Every case that contributes to the pattern is cited. No case is cited that
+  wasn't retrieved.
+- Case text is never copied verbatim. Tests check that no four-word sequence
+  of any case's free text appears in any answer, other than sequences that
+  come from the fixed labels.
+- The answer says the cases are "for reference, not a diagnosis" and names
+  its source. It never claims that ServiceNow was checked.
+
+### Prompt-injection defense and privacy
+
+- Case text can't act as instructions: it is never displayed or sent to the
+  LLM, and the answer contains fixed labels only.
+- A case whose free text contains instruction-like content is still withheld
+  from the evidence, using the DEMO-03 detector
+  (`app.knowledge.sanitize.contains_instructions`, which checks both raw and
+  normalized text). The withheld count is audited as `content_withheld`.
+- Caller names, e-mail addresses, phone numbers, work notes, internal
+  comments, credentials, tokens, `sys_id`s, incident numbers and
+  infrastructure details can't appear in a reply, because no displayed value
+  comes from those fields.
+
+### Authorization, audit and observability
+
+- **Authorization:** `authorize(identity, READ_KNOWLEDGE)` runs before the
+  search. Sanitized historical evidence is governed like knowledge, and the
+  BL-004 action set is unchanged. A wrong or missing tenant, or an anonymous
+  user, is denied and the repository is never searched.
+- **Audit:** `historical_case_search_requested / _authorized / _denied /
+  _completed / _failed`, with `tool=historical_case_search`.
+  - `_completed` carries `result_count` and `case_refs` (validated
+    `HC` + 5 digits, at most 5), plus `reason=content_withheld` when a case
+    was withheld.
+  - `_failed` carries `history_unavailable` or `missing_topic`.
+- **Observability:** `tool_started` / `tool_completed` / `tool_failed` with
+  `component=history`, `operation=historical_case_search`, `duration_ms` and
+  `result_count`.
+- The query text and case text are never logged. The history path writes no
+  conversation state.
+
+### Limitations (POC)
+
+- Keyword matching over a small synthetic fixture; no semantic search.
+- A follow-up "Have we seen this before?" doesn't reuse the earlier message,
+  because raw messages are not persisted (DEMO-01). The user is asked to name
+  the issue.
+- Phrase detection is rule-based. Unusual wording falls through to the
+  classifier, which treats it as it did before DEMO-04.
+- Cases are not tenant-scoped. BL-004 restricts use to the configured tenant.
 
 ---
 

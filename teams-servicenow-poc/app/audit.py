@@ -91,6 +91,13 @@ class AuditEventType(str, Enum):
     KNOWLEDGE_SEARCH_COMPLETED = "knowledge_search_completed"
     KNOWLEDGE_SEARCH_FAILED = "knowledge_search_failed"
 
+    # DEMO-04: read-only historical similar-case search.
+    HISTORICAL_CASE_SEARCH_REQUESTED = "historical_case_search_requested"
+    HISTORICAL_CASE_SEARCH_AUTHORIZED = "historical_case_search_authorized"
+    HISTORICAL_CASE_SEARCH_DENIED = "historical_case_search_denied"
+    HISTORICAL_CASE_SEARCH_COMPLETED = "historical_case_search_completed"
+    HISTORICAL_CASE_SEARCH_FAILED = "historical_case_search_failed"
+
 
 class AuditOutcome(str, Enum):
     REQUESTED = "requested"
@@ -134,7 +141,7 @@ DEFAULT_OUTCOME: dict[AuditEventType, AuditOutcome] = {
 # Tool names the gateway can execute (ServiceNowToolAction values), plus the
 # DEMO-03 read-only knowledge search.
 AUDIT_TOOLS = frozenset({"get_incident", "create_incident", "update_incident",
-                         "knowledge_search"})
+                         "knowledge_search", "historical_case_search"})
 MAX_AUDIT_ARTICLES = 5
 
 
@@ -147,6 +154,7 @@ _INCIDENT_RE = re.compile(r"^INC[0-9]{7,10}$")
 _REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 _CONVERSATION_REF_RE = re.compile(r"^[0-9a-f]{16}$")
 _ARTICLE_ID_RE = re.compile(r"^KB[0-9]{7}$")
+_CASE_REF_RE = re.compile(r"^HC[0-9]{5}$")
 
 
 def safe_ref(value: Any) -> Optional[str]:
@@ -213,6 +221,7 @@ class AuditEvent:
     reason: Optional[str] = None
     result_count: Optional[int] = None
     article_ids: tuple[str, ...] = ()
+    case_refs: tuple[str, ...] = ()
     timestamp: str = field(default_factory=_utc_now)
 
     def __post_init__(self) -> None:
@@ -244,6 +253,10 @@ class AuditEvent:
                 or not all(isinstance(a, str) and _ARTICLE_ID_RE.fullmatch(a)
                            for a in self.article_ids):
             raise ValueError("audit article_ids must be knowledge article identifiers")
+        if not isinstance(self.case_refs, tuple) or len(self.case_refs) > MAX_AUDIT_ARTICLES \
+                or not all(isinstance(r, str) and _CASE_REF_RE.fullmatch(r)
+                           for r in self.case_refs):
+            raise ValueError("audit case_refs must be historical case references")
         if not isinstance(self.timestamp, str) or not self.timestamp:
             raise ValueError("audit timestamp is required")
 
@@ -264,6 +277,7 @@ class AuditEvent:
             "reason": self.reason,
             "result_count": self.result_count,
             "article_ids": list(self.article_ids) or None,
+            "case_refs": list(self.case_refs) or None,
         }
         return {k: v for k, v in data.items() if v is not None}
 
