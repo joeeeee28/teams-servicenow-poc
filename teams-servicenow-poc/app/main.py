@@ -17,7 +17,20 @@ from app.servicenow import (
     ServiceNowError,
     ServiceNowNotFound,
 )
-from app.state import get_session, update_session
+from app.confirmation import ConfirmationDecision, evaluate_confirmation
+from app.security.authorization import AuthorizableAction, authorize
+from app.security.identity import ANONYMOUS, resolve_identity
+from app.tools import (
+    CreateIncidentToolRequest,
+    ServiceNowToolAction,
+    ServiceNowToolGateway,
+)
+from app.state import (
+    ConversationPhase,
+    get_session,
+    save_session,
+    update_session,
+)
 
 
 load_dotenv()
@@ -182,6 +195,108 @@ async def on_message(context):
 
 
         # ----------------------------------------------------
+        # BL-003: Confirmation gate
+        # When the conversation is waiting for confirmation,
+        # evaluate the message before any AI classification.
+        # The gate is pure: no ServiceNow, no network.
+        # ----------------------------------------------------
+
+        if session.phase is ConversationPhase.READY_FOR_CONFIRMATION:
+
+            decision = evaluate_confirmation(session, user_message)
+
+            if decision.confirmed:
+                # ── BL-004: resolve identity and authorize before EXECUTING ──
+                # BL-005 will call authorize() here and then invoke the tool.
+                # Identity is resolved from the same activity the message
+                # arrived on; Teams authentication has already validated it.
+                _identity = resolve_identity(
+                    context.activity,
+                    channel_tenant_id=(
+                        (getattr(context.activity, "channel_data", None) or {})
+                        .get("tenant", {}).get("id", "")
+                    ),
+                )
+                _authz = authorize(
+                    _identity,
+                    AuthorizableAction.CREATE_INCIDENT,
+                )
+
+                if not _authz.allowed:
+                    logger.warning(
+                        "authorization denied for user=%r action=%r",
+                        _identity.user_id,
+                        AuthorizableAction.CREATE_INCIDENT.value,
+                    )
+                    await context.send(
+                        "⛔ You are not authorised to perform this action.\n\n"
+                        "Please contact your IT administrator if you believe "
+                        "this is incorrect."
+                    )
+                    return
+
+                # Transition to EXECUTING phase.
+                session.transition_to(ConversationPhase.EXECUTING)
+                save_session(user_id, session)
+
+                # ── BL-005: Execute via ServiceNow Tool Gateway ────────────────
+                tool_request = CreateIncidentToolRequest(
+                    short_description=session.summary or "Service Desk Incident Request",
+                    description=session.collected_details.get("description", session.summary or ""),
+                    impact=session.collected_details.get("impact", "3"),
+                    urgency=session.collected_details.get("urgency", "3"),
+                )
+                tool_result = await servicenow_gateway.execute(
+                    _identity,
+                    _authz,
+                    ServiceNowToolAction.CREATE_INCIDENT,
+                    tool_request,
+                )
+
+                if tool_result.success:
+                    session.incident_number = tool_result.incident_number
+                    session.transition_to(ConversationPhase.COMPLETED)
+                    save_session(user_id, session)
+
+                    await context.send(
+                        f"✅ Incident **{tool_result.incident_number}** has been "
+                        f"created successfully.\n\n"
+                        f"**Summary:** {session.summary or ''}"
+                    )
+                else:
+                    session.last_error = tool_result.safe_message
+                    session.transition_to(ConversationPhase.FAILED)
+                    save_session(user_id, session)
+
+                    await context.send(
+                        f"❌ Failed to create incident: {tool_result.safe_message}"
+                    )
+                return
+
+            elif decision.cancelled:
+                # Transition to CANCELLED, then reset to IDLE.
+                session.transition_to(ConversationPhase.CANCELLED)
+                session.transition_to(ConversationPhase.IDLE)
+                save_session(user_id, session)
+
+                await context.send(
+                    "❌ Cancelled. No action has been taken.\n\n"
+                    "Let me know if there is anything else I can help with."
+                )
+                return
+
+            else:
+                # Ambiguous — remain in READY_FOR_CONFIRMATION and re-prompt.
+                await context.send(
+                    "I need an explicit confirmation or cancellation before "
+                    "I can proceed.\n\n"
+                    "Please reply with **yes** to confirm or **cancel** to "
+                    "cancel."
+                )
+                return
+
+
+        # ----------------------------------------------------
         # Ask Ollama to classify the current message
         # ----------------------------------------------------
 
@@ -228,22 +343,47 @@ async def on_message(context):
 
         elif intent == "create_incident":
 
-            update_session(
-                user_id,
-                awaiting_confirmation=False,
-            )
+            # BL-003: drive the state machine based on current phase.
+            session = get_session(user_id)
 
-            response = (
-                f"🎫 I can help create an incident for:\n"
-                f"**{summary}**\n\n"
-                "Before I create it, I'll collect a few details.\n\n"
-                "Please tell me:\n"
-                "1. What is the problem?\n"
-                "2. When did it start?\n"
-                "3. What error message are you seeing?\n"
-                "4. What troubleshooting have you already tried?\n"
-                "5. Is the issue affecting only you or multiple users?"
-            )
+            if session.phase is ConversationPhase.IDLE:
+                # Start collecting details.
+                session.transition_to(ConversationPhase.COLLECTING)
+                session.pending_action = "create_incident"
+                save_session(user_id, session)
+
+                response = (
+                    f"🎫 I can help create an incident for:\n"
+                    f"**{summary}**\n\n"
+                    "Before I create it, I'll collect a few details.\n\n"
+                    "Please tell me:\n"
+                    "1. What is the problem?\n"
+                    "2. When did it start?\n"
+                    "3. What error message are you seeing?\n"
+                    "4. What troubleshooting have you already tried?\n"
+                    "5. Is the issue affecting only you or multiple users?"
+                )
+
+            elif session.phase is ConversationPhase.COLLECTING:
+                # Details are arriving — move to confirmation.
+                session.summary = summary
+                session.transition_to(ConversationPhase.READY_FOR_CONFIRMATION)
+                save_session(user_id, session)
+
+                response = (
+                    f"📋 Here is what I have for the incident:\n"
+                    f"**{summary}**\n\n"
+                    "Would you like me to submit this? "
+                    "Reply **yes** to confirm or **cancel** to cancel."
+                )
+
+            else:
+                # Already past collecting — just acknowledge.
+                response = (
+                    "The incident workflow is already in progress. "
+                    "Please confirm or cancel the pending action."
+                )
+
 
 
         elif intent == "incident_status":
@@ -322,6 +462,7 @@ app.router.lifespan_context = lifespan
 # ============================================================
 
 servicenow = ServiceNowClient()
+servicenow_gateway = ServiceNowToolGateway(client=servicenow)
 
 
 # ============================================================
