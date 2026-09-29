@@ -98,6 +98,13 @@ class AuditEventType(str, Enum):
     HISTORICAL_CASE_SEARCH_COMPLETED = "historical_case_search_completed"
     HISTORICAL_CASE_SEARCH_FAILED = "historical_case_search_failed"
 
+    # DEMO-05: read-only service catalog discovery.
+    CATALOG_SEARCH_REQUESTED = "catalog_search_requested"
+    CATALOG_SEARCH_AUTHORIZED = "catalog_search_authorized"
+    CATALOG_SEARCH_DENIED = "catalog_search_denied"
+    CATALOG_SEARCH_COMPLETED = "catalog_search_completed"
+    CATALOG_SEARCH_FAILED = "catalog_search_failed"
+
 
 class AuditOutcome(str, Enum):
     REQUESTED = "requested"
@@ -141,8 +148,9 @@ DEFAULT_OUTCOME: dict[AuditEventType, AuditOutcome] = {
 # Tool names the gateway can execute (ServiceNowToolAction values), plus the
 # DEMO-03 read-only knowledge search.
 AUDIT_TOOLS = frozenset({"get_incident", "create_incident", "update_incident",
-                         "knowledge_search", "historical_case_search"})
+                         "knowledge_search", "historical_case_search", "search_catalog"})
 MAX_AUDIT_ARTICLES = 5
+MAX_AUDIT_ITEMS = 10
 
 
 # ===========================================================================
@@ -155,6 +163,7 @@ _REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 _CONVERSATION_REF_RE = re.compile(r"^[0-9a-f]{16}$")
 _ARTICLE_ID_RE = re.compile(r"^KB[0-9]{7}$")
 _CASE_REF_RE = re.compile(r"^HC[0-9]{5}$")
+_ITEM_REF_RE = re.compile(r"^CAT[0-9]{4}$")
 
 
 def safe_ref(value: Any) -> Optional[str]:
@@ -222,6 +231,7 @@ class AuditEvent:
     result_count: Optional[int] = None
     article_ids: tuple[str, ...] = ()
     case_refs: tuple[str, ...] = ()
+    item_refs: tuple[str, ...] = ()
     timestamp: str = field(default_factory=_utc_now)
 
     def __post_init__(self) -> None:
@@ -257,6 +267,10 @@ class AuditEvent:
                 or not all(isinstance(r, str) and _CASE_REF_RE.fullmatch(r)
                            for r in self.case_refs):
             raise ValueError("audit case_refs must be historical case references")
+        if not isinstance(self.item_refs, tuple) or len(self.item_refs) > MAX_AUDIT_ITEMS \
+                or not all(isinstance(r, str) and _ITEM_REF_RE.fullmatch(r)
+                           for r in self.item_refs):
+            raise ValueError("audit item_refs must be catalog item references")
         if not isinstance(self.timestamp, str) or not self.timestamp:
             raise ValueError("audit timestamp is required")
 
@@ -278,6 +292,7 @@ class AuditEvent:
             "result_count": self.result_count,
             "article_ids": list(self.article_ids) or None,
             "case_refs": list(self.case_refs) or None,
+            "item_refs": list(self.item_refs) or None,
         }
         return {k: v for k, v in data.items() if v is not None}
 

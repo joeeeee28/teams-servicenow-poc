@@ -114,7 +114,7 @@ _ALLOWED_OUTCOMES: dict[ObsEventName, frozenset[ObsOutcome]] = {
 # ServiceNow operation types (ServiceNowToolAction values), plus the DEMO-03
 # read-only knowledge search.
 OPERATIONS = frozenset({"get_incident", "create_incident", "update_incident",
-                        "knowledge_search", "historical_case_search"})
+                        "knowledge_search", "historical_case_search", "search_catalog"})
 
 # The ONLY metadata keys, each with its enumerated values.
 APPROVED_METADATA: dict[str, frozenset[str]] = {

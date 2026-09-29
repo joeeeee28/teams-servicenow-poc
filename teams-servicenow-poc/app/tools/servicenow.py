@@ -7,7 +7,8 @@ Provides a controlled business-operation boundary between identity/authorization
 and the low-level ServiceNow transport adapter (app/servicenow.py).
 
 The gateway guarantees:
-  1. Typed Tool Action allowlisting (GET_INCIDENT, CREATE_INCIDENT, UPDATE_INCIDENT).
+  1. Typed Tool Action allowlisting (GET_INCIDENT, CREATE_INCIDENT, UPDATE_INCIDENT,
+     SEARCH_CATALOG).
   2. Typed request contract validation (rejects arbitrary fields, scripts, table names).
   3. Strict authorization enforcement (consumes app.security.authorization.authorize()).
   4. Action matching (prevents authorization/tool action mismatch).
@@ -15,6 +16,9 @@ The gateway guarantees:
   6. DEMO-02: classified ServiceNow failures (``ServiceNowErrorCategory``) with
      fixed user-facing messages, and ``outcome_unknown`` when a create/update
      may have been applied but could not be confirmed.  Nothing is retried.
+  7. DEMO-05: read-only SEARCH_CATALOG over the approved service catalog
+     (a ``CatalogRepository``; authorized as READ_KNOWLEDGE; nothing is
+     requested or changed).
 """
 
 from __future__ import annotations
@@ -36,6 +40,14 @@ from app.audit import (
 import app.observability as _obs
 from app.security.authorization import AuthorizableAction, AuthorizationDecision
 from app.security.identity import UserIdentity
+from app.catalog import (
+    CatalogRepository,
+    CatalogSearchRequest,
+    CatalogSearchResult,
+    CatalogService,
+    CatalogUnavailableError,
+    LocalCatalogRepository,
+)
 from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
 from app.servicenow_errors import ServiceNowErrorCategory, failure_message
 
@@ -65,6 +77,7 @@ class ServiceNowToolAction(str, Enum):
     GET_INCIDENT = "get_incident"
     CREATE_INCIDENT = "create_incident"
     UPDATE_INCIDENT = "update_incident"
+    SEARCH_CATALOG = "search_catalog"      # DEMO-05, read-only
 
 
 # Mapping from ServiceNowToolAction to the required AuthorizableAction
@@ -72,6 +85,9 @@ _ACTION_MAPPING: dict[ServiceNowToolAction, AuthorizableAction] = {
     ServiceNowToolAction.GET_INCIDENT: AuthorizableAction.READ_INCIDENT,
     ServiceNowToolAction.CREATE_INCIDENT: AuthorizableAction.CREATE_INCIDENT,
     ServiceNowToolAction.UPDATE_INCIDENT: AuthorizableAction.UPDATE_INCIDENT,
+    # Catalog discovery reads reference information only (BL-004 action set
+    # unchanged); creating a request will require CREATE_REQUEST.
+    ServiceNowToolAction.SEARCH_CATALOG: AuthorizableAction.READ_KNOWLEDGE,
 }
 
 
@@ -285,6 +301,28 @@ class UpdateIncidentToolRequest:
         return normalised, fields
 
 
+@dataclass(frozen=True)
+class SearchCatalogToolRequest:
+    """
+    Request contract for SEARCH_CATALOG (DEMO-05).  Only free search words:
+    no table, field, query, sys_id or catalog id can be supplied.
+    """
+
+    query: str
+    max_results: int = 5
+
+    def validate(self) -> CatalogSearchRequest:
+        if not isinstance(self.query, str):
+            raise ToolValidationError("Catalog search must be text.")
+        try:
+            return CatalogSearchRequest(self.query, max_results=self.max_results)
+        except ValueError:
+            raise ToolValidationError("Catalog search request is invalid.") from None
+
+    def __repr__(self) -> str:  # never echo user text into logs
+        return f"SearchCatalogToolRequest(max_results={self.max_results!r})"
+
+
 # ===========================================================================
 # Typed Tool Result
 # ===========================================================================
@@ -321,6 +359,8 @@ class ToolResult:
     outcome_unknown: bool = False
     """DEMO-02: True when a create/update may have been applied but could not
     be confirmed.  Such a result is still a failure — never a success."""
+    catalog: Optional[CatalogSearchResult] = None
+    """DEMO-05: display-safe catalog search result (SEARCH_CATALOG only)."""
 
     @classmethod
     def ok(
@@ -329,6 +369,7 @@ class ToolResult:
         safe_message: str,
         incident_number: Optional[str] = None,
         incident: Optional[dict[str, Any]] = None,
+        catalog: Optional[CatalogSearchResult] = None,
     ) -> ToolResult:
         """Construct a successful ToolResult."""
         return cls(
@@ -338,6 +379,7 @@ class ToolResult:
             incident=incident,
             safe_message=safe_message,
             error_code=None,
+            catalog=catalog,
         )
 
     @classmethod
@@ -394,6 +436,7 @@ class ServiceNowToolGateway:
         self,
         client: Optional[ServiceNowClient] = None,
         audit_logger: Optional[AuditLogger] = None,
+        catalog: Optional[CatalogRepository] = None,
     ) -> None:
         """
         Initialize the Tool Gateway.
@@ -407,6 +450,13 @@ class ServiceNowToolGateway:
         """
         self._client = client
         self._audit = audit_logger or _default_audit_logger
+        self._catalog = catalog
+
+    def _get_catalog(self) -> CatalogService:
+        """The approved catalog behind SEARCH_CATALOG (POC: local fixture)."""
+        if self._catalog is None:
+            self._catalog = LocalCatalogRepository.from_fixture()
+        return CatalogService(self._catalog)
 
     def _get_client(self) -> ServiceNowClient:
         """Get or initialize the underlying ServiceNowClient adapter."""
@@ -446,9 +496,10 @@ class ServiceNowToolGateway:
                                duration_ms=_obs.elapsed_ms(started))
             raise
         if result.success:
+            extra = {"result_count": len(result.catalog.entries)} if result.catalog else {}
             self._observe_tool(_obs.ObsEventName.TOOL_COMPLETED, _obs.ObsOutcome.SUCCESS,
                                identity, tool_action, correlation_id,
-                               duration_ms=_obs.elapsed_ms(started))
+                               duration_ms=_obs.elapsed_ms(started), **extra)
         else:
             self._observe_tool(_obs.ObsEventName.TOOL_FAILED, _failure_outcome(result.error_code),
                                identity, tool_action, correlation_id,
@@ -544,6 +595,9 @@ class ServiceNowToolGateway:
 
             elif tool_action is ServiceNowToolAction.UPDATE_INCIDENT:
                 return await self._execute_update_incident(identity, request)
+
+            elif tool_action is ServiceNowToolAction.SEARCH_CATALOG:
+                return await self._execute_search_catalog(identity, request)
 
             else:
                 raise ToolValidationError(f"Unsupported tool action: {tool_action!r}")
@@ -672,6 +726,25 @@ class ServiceNowToolGateway:
             # Never retried: a create is not idempotent.
             raise (_servicenow_failure(exc, operation="create")
                    or ToolExecutionError("Failed to create incident in ServiceNow.")) from None
+
+    async def _execute_search_catalog(
+        self,
+        identity: UserIdentity,
+        request: Any,
+    ) -> ToolResult:
+        """Execute SEARCH_CATALOG (DEMO-05): read-only, no ServiceNow write."""
+        if not isinstance(request, SearchCatalogToolRequest):
+            raise ToolValidationError("Request must be an instance of SearchCatalogToolRequest.")
+        search = request.validate()
+        try:
+            result = await self._get_catalog().search(search)
+        except CatalogUnavailableError:
+            raise ToolExecutionError("The service catalog is temporarily unavailable.") from None
+        return ToolResult.ok(
+            action=ServiceNowToolAction.SEARCH_CATALOG,
+            safe_message="Catalog searched.",
+            catalog=result,
+        )
 
     async def _execute_update_incident(
         self,

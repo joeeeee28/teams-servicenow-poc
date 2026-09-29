@@ -60,6 +60,9 @@ from app.history import (
     format_history_answer,
     is_history_question,
 )
+from app.catalog import is_catalog_browse
+from app.catalog.service import UNAVAILABLE_MESSAGE as _CATALOG_UNAVAILABLE
+from app.catalog.service import format_catalog_answer
 from app.knowledge import (
     KnowledgeOutcome,
     KnowledgeSearchRequest,
@@ -76,6 +79,7 @@ from app.security.identity import ANONYMOUS, resolve_identity
 from app.tools import (
     CreateIncidentToolRequest,
     GetIncidentToolRequest,
+    SearchCatalogToolRequest,
     UpdateIncidentToolRequest,
     ServiceNowToolAction,
     ServiceNowToolGateway,
@@ -481,6 +485,18 @@ async def _handle_message(context):
 
 
         # ----------------------------------------------------
+        # DEMO-05: explicit "what can I request?" — deterministic,
+        # read-only catalog browse through the Tool Gateway.
+        # ----------------------------------------------------
+
+        if is_catalog_browse(user_message):
+
+            await context.send(await _answer_catalog(context, user_message, browse=True))
+
+            return
+
+
+        # ----------------------------------------------------
         # Ask Ollama to classify the current message
         # ----------------------------------------------------
 
@@ -564,11 +580,9 @@ async def _handle_message(context):
 
         elif intent == "service_request":
 
-            response = (
-                f"📝 I understand that you want to request:\n"
-                f"**{summary}**\n\n"
-                "I'll help identify the appropriate IT service."
-            )
+            # DEMO-05: read-only discovery of approved catalog items from the
+            # user's own words (never the LLM summary).  Nothing is requested.
+            response = await _answer_catalog(context, user_message)
 
 
         elif intent == "human_escalation":
@@ -883,6 +897,69 @@ async def _answer_history(context, user_message: str) -> str:
             duration_ms=duration, **observe,
         )
     return format_history_answer(result)
+
+
+# ============================================================
+# DEMO-05: SERVICE CATALOG DISCOVERY (read-only, via the Tool Gateway)
+# ============================================================
+
+_NOT_AUTHORISED_CATALOG = (
+    "⛔ You are not authorised to browse the service catalog.\n\n"
+    "Please contact your IT administrator if you believe this is incorrect."
+)
+
+
+async def _answer_catalog(context, user_message: str, *, browse: bool = False) -> str:
+    """
+    identity → authorize(READ_KNOWLEDGE) → Tool Gateway SEARCH_CATALOG →
+    display-safe catalog reply.  Read-only: no request is created, nothing in
+    ServiceNow changes, no confirmation, no state change.  Audit records item
+    references and counts only — never the query text or catalog text.
+
+    *browse* (an explicit "what can I request?" / "show me the catalog")
+    lists the catalog with an empty query instead of keyword-searching the
+    message.
+    """
+    base = dict(
+        correlation_id=_audit_request_id(),
+        action=AuthorizableAction.READ_KNOWLEDGE,
+        tool=ServiceNowToolAction.SEARCH_CATALOG.value,
+    )
+    _audit(AuditEventType.CATALOG_SEARCH_REQUESTED, context, **base)
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    authz = _authorize(identity, AuthorizableAction.READ_KNOWLEDGE)
+    if not authz.allowed:
+        _audit(AuditEventType.CATALOG_SEARCH_DENIED, context, **base)
+        return _NOT_AUTHORISED_CATALOG
+    _audit(AuditEventType.CATALOG_SEARCH_AUTHORIZED, context, **base)
+
+    try:
+        tool_result = await servicenow_gateway.execute(
+            identity,
+            authz,
+            ServiceNowToolAction.SEARCH_CATALOG,
+            SearchCatalogToolRequest("" if browse else user_message),
+            correlation_id=base["correlation_id"],
+        )
+    except Exception as exc:  # noqa: BLE001 — the gateway should never raise
+        logger.error("catalog search: gateway raised %s", type(exc).__name__)
+        _audit(AuditEventType.CATALOG_SEARCH_FAILED, context, reason="execution_error", **base)
+        return _CATALOG_UNAVAILABLE
+
+    if not tool_result.success or tool_result.catalog is None:
+        _audit(AuditEventType.CATALOG_SEARCH_FAILED, context,
+               reason=_failure_reason(tool_result), **base)
+        return _CATALOG_UNAVAILABLE
+
+    result = tool_result.catalog
+    _audit(AuditEventType.CATALOG_SEARCH_COMPLETED, context,
+           result_count=len(result.entries), item_refs=result.item_refs,
+           reason="content_withheld" if result.withheld else None, **base)
+    return format_catalog_answer(result)
 
 
 # ============================================================

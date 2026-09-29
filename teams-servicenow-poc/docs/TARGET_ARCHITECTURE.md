@@ -26,6 +26,8 @@ FastAPI (app/main.py)
         │
         ├─► [DEMO-04] Historical similar cases (app/history/) — read-only, no side effects
         │
+        ├─► [DEMO-05] Service catalog discovery (app/catalog/, via the Tool Gateway) — read-only
+        │
         ├─► Conversation State Machine (app/state.py)  ← BL-002
         │           │
         │           └─ ConversationState / StateRepository (StateKey)
@@ -1268,6 +1270,125 @@ Retrieval uses the same tokenizer as DEMO-03. Question words ("have we seen
 - Phrase detection is rule-based. Unusual wording falls through to the
   classifier, which treats it as it did before DEMO-04.
 - Cases are not tenant-scoped. BL-004 restricts use to the configured tenant.
+
+---
+
+## DEMO-05 — Service Catalog Discovery
+
+Employees can ask "What can I request?" or "I need Microsoft Visio." and see
+approved catalog items: the name, purpose and the information a request will
+need. Discovery is read-only. It creates no request, changes nothing in
+ServiceNow and needs no confirmation.
+
+```
+Teams message ──► on_message (after COLLECTING / READY / EXECUTING, the BL-001
+   │               router and DEMO-04 detection)
+   ├─ is_catalog_browse ("what can I request?", "service catalog"…) — no LLM
+   └─ LLM intent service_request (intent only; retrieval uses the user's words)
+   ▼
+_answer_catalog ── identity → authorize(READ_KNOWLEDGE) → audit
+   ▼
+ServiceNowToolGateway.execute(identity, decision, SEARCH_CATALOG,
+                              SearchCatalogToolRequest(query))  ← BL-005 guards apply
+   ▼
+CatalogService ── CatalogRepository (interface) ── LocalCatalogRepository (approved POC catalog)
+   ▼                                              └ future: ServiceNowCatalogRepository
+availability re-check → sanitize every displayed value → CatalogEntry
+   ▼
+format_catalog_answer: one item / clarification / browse / honest no-match
+```
+
+### Tool Gateway
+
+- **New action.** `ServiceNowToolAction.SEARCH_CATALOG` is a read-only action
+  mapped to `READ_KNOWLEDGE`. Catalog discovery reads reference information,
+  so the BL-004 action set is unchanged; creating a request will require
+  `CREATE_REQUEST`.
+- **Guards.** All gateway guards apply: identified identity, an allowed
+  decision, allowlisted action, decision and action match, and a typed
+  request.
+- **Request contract.** `SearchCatalogToolRequest` accepts only the search
+  text and a result limit (1–5). No table, field, query, `sys_id` or item id
+  can be passed, and its repr never shows the text.
+- **Result.** The gateway returns a `ToolResult` whose `catalog` holds the
+  display-safe result. Catalog failures become a safe `EXECUTION_ERROR`. The
+  ServiceNow client is not called.
+- **Observability.** The gateway's existing BL-011 events
+  (`tool_started` / `tool_completed`, `operation=search_catalog`) now also
+  carry `result_count`.
+
+### Catalog data
+
+- **`CatalogItem`** (validated and immutable) has:
+  - `item_ref` (`CAT` + 4 digits, the only id users see);
+  - `sys_id` (32 hex characters, kept for the later request step; never
+    displayed or logged);
+  - name, description, category, `active`, `approved`;
+  - up to 8 `CatalogVariable`s (identifier name, label, `required`,
+    text or choice with fixed choices);
+  - keywords used for ranking.
+- **Availability.** Only items that are `active` **and** `approved` can be
+  returned. The repository filters on this and the service checks it again.
+- **POC source.** `LocalCatalogRepository` holds the approved catalog as
+  Python records (Visio, Acrobat, Project, VPN access, SharePoint access,
+  laptop, monitor, plus one inactive and one unapproved item). There is no
+  file, database or network access.
+- **Future source.** A `ServiceNowCatalogRepository` would read the catalog
+  through a fixed table, fixed fields and a fixed query in the ServiceNow
+  adapter, filtered to the approved allowlist, behind the same gateway action.
+
+### Retrieval and replies
+
+- Tokens come from the user's own words, minus request words ("need",
+  "request", "catalog"…). Score = 3 × name + 2 × keyword + 1 × description
+  matches, and anything below 3 is dropped. Ties are broken by item
+  reference, and the result is deterministic.
+- **One match** (or a top match scoring at least twice the next) shows the
+  name, purpose and the required information (optional variables are not
+  listed). Choice variables show their allowed values.
+- **Several close matches** get a numbered clarification question ("Which
+  one do you mean?").
+- **No match** gets "I couldn't find an approved catalog item for that, and I
+  won't guess one."
+- **No item words** ("What can I request?") lists available items by
+  category, at most 10.
+- Every reply ends with "This is catalog information only — no request has
+  been created."
+
+### Untrusted content, privacy and safety
+
+- Catalog text (name, description, variable labels, choices) is untrusted.
+  Each value passes through the DEMO-03 sanitizer
+  (`app.knowledge.sanitize.safe_text`: normalization, then injection, secret,
+  internal-note, PII, infrastructure and URL checks). An item with any unsafe
+  or instruction-like value is withheld entirely, and this is audited as
+  `content_withheld`.
+- The displayed text is the normalized, checked text. `sys_id`s and keywords
+  are never displayed.
+- The LLM only picks the intent. It never sees catalog content and can't
+  choose items or ids. The catalog package imports no ServiceNow, tool, state,
+  LLM, file or network module (enforced by tests).
+- **Authorization:** `READ_KNOWLEDGE` is checked in the handler and again at
+  the gateway. A wrong or missing tenant, or an anonymous user, is denied and
+  the gateway is never called.
+- **Audit:** `catalog_search_requested / _authorized / _denied / _completed /
+  _failed`, with `tool=search_catalog`. `_completed` carries `result_count`
+  and `item_refs` (validated `CAT` + 4 digits, at most 10).
+- Neither the query text nor catalog text is logged. The dedicated browse
+  path writes no state. The classifier path stores only the existing intent,
+  as before.
+
+### Limitations (POC)
+
+- The catalog is a local approved fixture. Live ServiceNow catalog reads are
+  a future repository, and the `sys_id`s are placeholders.
+- Keyword matching only, and a clarification reply isn't remembered: the user
+  answers with the item name, which is searched again.
+- Item-specific discovery (for example "I need Visio") depends on the LLM's
+  `service_request` intent. Only explicit browse phrases work without the
+  LLM.
+- The catalog is not tenant-scoped. BL-004 restricts use to the configured
+  tenant.
 
 ---
 

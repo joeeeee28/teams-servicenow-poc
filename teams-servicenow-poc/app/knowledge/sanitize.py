@@ -129,6 +129,20 @@ def _unsafe(text: str) -> bool:
             or _any(PII_PATTERNS, text) or _any(INFRA_PATTERNS, text))
 
 
+def safe_text(text: str) -> Optional[str]:
+    """
+    Normalized display text for a single untrusted value, or None if it is
+    instruction-like or contains secrets, internal notes, PII,
+    infrastructure details or URLs.
+    """
+    if not isinstance(text, str) or contains_instructions(text):
+        return None
+    normalized = _normalize(text)
+    if _unsafe(normalized):
+        return None
+    return _clean(normalized) or None
+
+
 def sanitize_article(article: KnowledgeArticle) -> Optional[SanitizedArticle]:
     """
     Safe summary + steps, or ``None`` if nothing safe remains.
