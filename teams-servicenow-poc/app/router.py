@@ -36,6 +36,8 @@ PURITY GUARANTEE
 import re
 from typing import Optional
 
+from app.incident_update import parse_update_command
+
 # ---------------------------------------------------------------------------
 # Approved whole-message pattern for incident_status
 # ---------------------------------------------------------------------------
@@ -120,6 +122,13 @@ def route_message(message: str) -> Optional[RouteResult]:
         # Normalise to upper-case regardless of how the user typed it.
         incident_number = m.group(1).upper()
         return RouteResult(intent="incident_status", incident_number=incident_number)
+
+    # ── Incident update (BL-009) ─────────────────────────────────────────────
+    # Whole-message grammar in app.incident_update; never executes anything —
+    # the caller starts a collection that still requires confirmation.
+    command = parse_update_command(normalised)
+    if command is not None:
+        return RouteResult(intent="incident_update", incident_number=command.incident_number)
 
     # ── No deterministic route ───────────────────────────────────────────────
     return None

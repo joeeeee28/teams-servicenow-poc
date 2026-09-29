@@ -94,7 +94,8 @@ logger = logging.getLogger(__name__)
 EXECUTABLE_ACTIONS: frozenset[str] = frozenset(
     {
         "create_incident",
-        # Future: "update_incident", "submit_service_request", etc.
+        "update_incident",  # BL-009
+        # Future: "submit_service_request", etc.
         # Add identifiers here only when BL-005 implements their execution.
     }
 )

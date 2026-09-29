@@ -47,6 +47,9 @@ FastAPI (app/main.py)
 - Is a pure synchronous function: no network, no ServiceNow, no credentials.
 - Returns `None` if no deterministic route matches; the caller falls through
   to AI classification.
+- Routes: `incident_status` (BL-001/BL-008) and `incident_update` (BL-009;
+  its grammar lives in `app/incident_update.py`). Routing never executes
+  anything.
 
 **Security note:** The router is not the security boundary. Independent
 validation in `app/servicenow._validate_incident_number` always runs before
@@ -600,6 +603,72 @@ ServiceNowToolGateway.execute(GET_INCIDENT, GetIncidentToolRequest)   ← once, 
   `sys_id`). Description, assignment group and assigned to are therefore
   not shown until that contract is extended. Values appear as returned by
   ServiceNow (for example, `State: 2`).
+
+---
+
+## BL-009 — Controlled Incident Update
+
+Updates `short_description`, `description`, `impact` and/or `urgency` of
+one existing incident, and nothing else. The update is a side effect, so it
+always requires explicit BL-003 confirmation.
+
+```
+"Update INC0010002 impact to 1 and urgency to 2"
+   │ router: whole-message update grammar (app/incident_update.parse_update_command)
+   ▼
+resolve_identity → authorize(UPDATE_INCIDENT) ─ denied ─► "not authorised"   (nothing read or stored)
+   ▼
+gateway GET_INCIDENT (READ_INCIDENT) → current values ─ not found/failure ─► safe message (no state)
+   ▼
+IDLE → COLLECTING ─(valid changes, nothing outstanding)─► READY_FOR_CONFIRMATION
+   │   "Impact: 3 → 1 / Urgency: 3 → 2 … Shall I apply these changes?"
+   ▼  explicit confirmation (BL-003; "update_incident" added to EXECUTABLE_ACTIONS)
+re-validate changes → resolve_identity → authorize(UPDATE_INCIDENT) ─ denied ─► stays READY
+   ▼
+EXECUTING → gateway UPDATE_INCIDENT (UpdateIncidentToolRequest), once, no retry
+   ├─ success ─► COMPLETED  (reply shows the values ServiceNow returned)
+   └─ failure ─► FAILED     (safe message)
+```
+
+- **Command grammar.** A message is an update command only if the whole
+  message fits: `<update|change|set|modify|edit> [the] [incident] INC#
+  [items]` or `<verb> [the] <field> of INC# to <value> [and …]`. Items are
+  `<field> [to|=|:|as|is|should be] <value>`, separated by `,` / `and`.
+  Appended text such as `; DROP TABLE`, `<script>`, `and delete it` or
+  `ignore previous instructions` makes it a non-command, which falls
+  through to the classifier. The classifier has no update intent and can
+  never trigger an update.
+- **Values.** Impact and urgency accept `1`, `2` or `3` only. The short
+  description is at most 160 characters. Text values are data: they are
+  shown in the summary and need confirmation. A change equal to the
+  current value is refused. Nothing is defaulted.
+- **Unsupported fields.** Priority, state, assignment group, assigned to,
+  category, caller, work notes and similar are recognised only so they can
+  be refused with an explanation.
+- **Current values** come only from the gateway read. Fields the adapter
+  does not return (currently `description`) show "(current value not
+  available)" and are never guessed.
+- **State.** The update reuses the existing phases.
+  `pending_action = "update_incident"` selects the update collector while
+  COLLECTING and the update executor after confirmation.
+  `collected_details` holds `changes`, `requested` and `current`, and only
+  `changes` (re-validated against the four allowed fields) reaches the
+  gateway. Cancellation follows COLLECTING/READY → CANCELLED → IDLE and
+  clears everything.
+- **Authorization.** Update permission is checked when the request starts
+  and again immediately before execution. Under the default BL-004 policy
+  every user is an `EMPLOYEE`, and employees cannot update incidents. The
+  flow only succeeds once a role mapping grants `SERVICE_DESK_AGENT` or
+  `SERVICE_DESK_ADMIN`.
+- Mid-workflow messages are handled by that workflow. An incident number
+  or update command sent while COLLECTING or READY_FOR_CONFIRMATION is not
+  treated as a new update or a status lookup.
+- **Fail-closed phase re-checks.** After the current-value read, the
+  session is read again. If another message changed the conversation
+  meanwhile, the new update is not started and the reply is "request in
+  progress". The existing conversation is left intact. The executor also
+  refuses to run unless the phase is still READY_FOR_CONFIRMATION, and in
+  that case skips identity, authorization and the gateway.
 
 ---
 

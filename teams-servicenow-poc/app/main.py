@@ -30,12 +30,22 @@ from app.incident_status import (
     lookup_failed_message,
     not_found_message,
 )
+from app.incident_update import (
+    UPDATE_INCIDENT_ACTION,
+    current_values,
+    parse_update_command,
+    process_update_message,
+    start_update_collection,
+    unsupported_fields_message,
+    validated_update,
+)
 from app.router import route_message
 from app.security.authorization import AuthorizableAction, authorize
 from app.security.identity import ANONYMOUS, resolve_identity
 from app.tools import (
     CreateIncidentToolRequest,
     GetIncidentToolRequest,
+    UpdateIncidentToolRequest,
     ServiceNowToolAction,
     ServiceNowToolGateway,
     ToolResult,
@@ -189,7 +199,11 @@ async def on_message(context):
 
         if session.phase is ConversationPhase.COLLECTING:
 
-            collection = process_collection_message(session, user_message)
+            if session.pending_action == UPDATE_INCIDENT_ACTION:
+                # BL-009: collecting an incident update.
+                collection = process_update_message(session, user_message)
+            else:
+                collection = process_collection_message(session, user_message)
             save_session(user_id, session)
 
             await context.send(collection.reply)
@@ -209,8 +223,12 @@ async def on_message(context):
             decision = evaluate_confirmation(session, user_message)
 
             if decision.confirmed:
-                # BL-007: validate → authorize → EXECUTING → Tool Gateway.
-                await _create_confirmed_incident(context, user_id, session)
+                if session.pending_action == UPDATE_INCIDENT_ACTION:
+                    # BL-009: validate → authorize → EXECUTING → Tool Gateway.
+                    await _update_confirmed_incident(context, user_id, session)
+                else:
+                    # BL-007: validate → authorize → EXECUTING → Tool Gateway.
+                    await _create_confirmed_incident(context, user_id, session)
                 return
 
             elif decision.cancelled:
@@ -265,6 +283,16 @@ async def on_message(context):
 
             await context.send(
                 await _lookup_incident_status(context, route.incident_number)
+            )
+
+            return
+
+        if route is not None and route.intent == "incident_update":
+
+            # BL-009: starts a collection only; any change still needs
+            # explicit confirmation before it is executed.
+            await context.send(
+                await _start_incident_update(context, user_id, session, user_message)
             )
 
             return
@@ -570,6 +598,203 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
         return not_found_message(incident_number)
 
     return lookup_failed_message(incident_number)
+
+
+# ============================================================
+# BL-009: CONTROLLED INCIDENT UPDATE
+# ============================================================
+
+_NOT_AUTHORISED_ACTION = (
+    "⛔ You are not authorised to perform this action.\n\n"
+    "Please contact your IT administrator if you believe "
+    "this is incorrect."
+)
+
+
+_REQUEST_IN_PROGRESS = (
+    "⏳ You already have a request in progress. Please finish or cancel it "
+    "before starting a new update."
+)
+
+
+async def _start_incident_update(context, user_id: str, session, user_message: str) -> str:
+    """
+    Start collecting an update for one incident.
+
+    identity → authorize(UPDATE_INCIDENT) → read the current values through
+    the gateway (GET_INCIDENT, READ_INCIDENT) → IDLE → COLLECTING
+    (→ READY_FOR_CONFIRMATION).  Nothing is written here.
+    """
+    command = parse_update_command(user_message)
+    if command is None:  # pragma: no cover — the router already matched
+        return "I didn't understand that update request."
+
+    if command.unsupported:
+        return unsupported_fields_message(command.unsupported)
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    if not authorize(identity, AuthorizableAction.UPDATE_INCIDENT).allowed:
+        logger.warning(
+            "authorization denied for user=%r action=%r",
+            identity.user_id,
+            AuthorizableAction.UPDATE_INCIDENT.value,
+        )
+        return _NOT_AUTHORISED_ACTION
+
+    read_authz = authorize(identity, AuthorizableAction.READ_INCIDENT)
+    if not read_authz.allowed:
+        return _NOT_AUTHORISED_ACTION
+
+    number = command.incident_number
+    try:
+        read_result = await servicenow_gateway.execute(
+            identity,
+            read_authz,
+            ServiceNowToolAction.GET_INCIDENT,
+            GetIncidentToolRequest(incident_number=number),
+        )
+    except Exception as exc:
+        logger.error(
+            "incident update: current-value read raised %s for user=%r",
+            type(exc).__name__,
+            identity.user_id,
+        )
+        return lookup_failed_message(number)
+
+    if not read_result.success or not read_result.incident:
+        if read_result.error_code == "NOT_FOUND":
+            return not_found_message(number)
+        return lookup_failed_message(number)
+
+    # The read above awaited, so another message may have changed this
+    # user's conversation meanwhile.  Fail closed: never overwrite it.
+    session = get_session(user_id)
+    if session.phase not in (
+        ConversationPhase.IDLE,
+        ConversationPhase.COMPLETED,
+        ConversationPhase.FAILED,
+        ConversationPhase.CANCELLED,
+    ):
+        logger.warning(
+            "incident update not started: conversation changed during read "
+            "for user=%r",
+            user_id,
+        )
+        return _REQUEST_IN_PROGRESS
+
+    result = start_update_collection(
+        session, command, current_values(read_result.incident)
+    )
+    save_session(user_id, session)
+    return result.reply
+
+
+async def _update_confirmed_incident(context, user_id: str, session) -> None:
+    """
+    Execute an update the user has explicitly confirmed (BL-003).
+
+    Re-validate the pending changes → resolve identity → authorize
+    UPDATE_INCIDENT → EXECUTING → Tool Gateway (exactly once, never retried)
+    → COMPLETED or FAILED.
+    """
+    # Fail closed unless the conversation is still awaiting this confirmation.
+    if session.phase is not ConversationPhase.READY_FOR_CONFIRMATION:
+        logger.warning(
+            "incident update not executed: phase is %r for user=%r",
+            session.phase.value,
+            user_id,
+        )
+        await context.send(_REQUEST_IN_PROGRESS)
+        return
+
+    try:
+        number, changes = validated_update(session)
+    except ValueError:
+        logger.warning(
+            "incident update blocked: pending update missing or invalid for user=%r",
+            user_id,
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(user_id, session)
+        await context.send(
+            "⚠️ Some update details are missing or invalid, so the incident "
+            "was not changed.\n\n"
+            "Please start a new update request."
+        )
+        return
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    authz = authorize(identity, AuthorizableAction.UPDATE_INCIDENT)
+
+    if not authz.allowed:
+        logger.warning(
+            "authorization denied for user=%r action=%r",
+            identity.user_id,
+            AuthorizableAction.UPDATE_INCIDENT.value,
+        )
+        await context.send(_NOT_AUTHORISED_ACTION)
+        return
+
+    tool_request = UpdateIncidentToolRequest(incident_number=number, **changes)
+
+    # -- EXECUTING is persisted BEFORE the side effect ---------------------
+    session.transition_to(ConversationPhase.EXECUTING)
+    save_session(user_id, session)
+
+    # -- Single gateway call — UPDATE is never retried ---------------------
+    try:
+        tool_result = await servicenow_gateway.execute(
+            identity,
+            authz,
+            ServiceNowToolAction.UPDATE_INCIDENT,
+            tool_request,
+        )
+    except Exception as exc:
+        logger.error(
+            "incident update: gateway raised %s for user=%r",
+            type(exc).__name__,
+            user_id,
+        )
+        tool_result = ToolResult.fail(
+            action=ServiceNowToolAction.UPDATE_INCIDENT,
+            safe_message="A ServiceNow error occurred while updating the incident.",
+            error_code="EXECUTION_ERROR",
+        )
+
+    if tool_result.success:
+        session.transition_to(ConversationPhase.COMPLETED)
+        save_session(user_id, session)
+
+        if tool_result.incident:
+            await context.send(
+                "✅ ServiceNow confirmed the update.\n\n"
+                + format_incident_status(tool_result.incident, number)
+            )
+        else:
+            await context.send(
+                f"✅ ServiceNow confirmed the update to **{number}** but did not "
+                "return the updated values.\n\n"
+                "Please do not submit it again — check the incident status to "
+                "see the current values."
+            )
+        return
+
+    session.last_error = tool_result.safe_message
+    session.transition_to(ConversationPhase.FAILED)
+    save_session(user_id, session)
+
+    await context.send(
+        f"❌ The update to {number} could not be applied: "
+        f"{tool_result.safe_message}\n\n"
+        "It will not be retried automatically."
+    )
 
 
 # ============================================================
