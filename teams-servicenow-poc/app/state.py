@@ -202,6 +202,11 @@ class ConversationState:
     last_error
         Human-readable description of the most recent failure.  Populated
         when entering ``FAILED``; cleared on ``FAILED → IDLE``.
+
+    correlation_id
+        Audit correlation identifier (BL-010) shared by every audit event of
+        one logical operation (request → confirmation → execution), which
+        spans several Teams messages.  Cleared on reset to ``IDLE``.
     """
 
     phase: ConversationPhase = ConversationPhase.IDLE
@@ -211,6 +216,7 @@ class ConversationState:
     pending_action: str | None = None
     incident_number: str | None = None
     last_error: str | None = None
+    correlation_id: str | None = None
 
     def transition_to(self, new_phase: ConversationPhase) -> "ConversationState":
         """
@@ -236,6 +242,7 @@ class ConversationState:
             self.pending_action = None
             self.incident_number = None
             self.last_error = None
+            self.correlation_id = None
 
         self.phase = new_phase
         return self

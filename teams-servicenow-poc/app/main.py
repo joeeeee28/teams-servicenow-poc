@@ -1,3 +1,4 @@
+import contextvars
 import logging
 import os
 import secrets
@@ -8,6 +9,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from microsoft_teams.apps import App, FastAPIAdapter
 
 from app.ai import classify_message
+from app.audit import (
+    AuditEventType,
+    AuditOutcome,
+    audit_logger,
+    conversation_ref,
+    new_correlation_id,
+    safe_incident_number,
+    safe_ref,
+)
 from app.models import (
     CreateIncidentRequest,
     UpdateIncidentRequest,
@@ -41,6 +51,7 @@ from app.incident_update import (
 )
 from app.router import route_message
 from app.security.authorization import AuthorizableAction, authorize
+from app.security import identity as _identity_module
 from app.security.identity import ANONYMOUS, resolve_identity
 from app.tools import (
     CreateIncidentToolRequest,
@@ -181,6 +192,11 @@ async def on_message(context):
     )
 
 
+    # BL-010: one audit request id per incoming Teams message.
+    _AUDIT_REQUEST_ID.set(
+        safe_ref(getattr(context.activity, "id", None)) or new_correlation_id()
+    )
+
     try:
 
         # ----------------------------------------------------
@@ -206,6 +222,9 @@ async def on_message(context):
                 collection = process_collection_message(session, user_message)
             save_session(user_id, session)
 
+            if session.phase is ConversationPhase.READY_FOR_CONFIRMATION:
+                _audit_session(AuditEventType.CONFIRMATION_REQUESTED, context, session)
+
             await context.send(collection.reply)
 
             return
@@ -223,6 +242,7 @@ async def on_message(context):
             decision = evaluate_confirmation(session, user_message)
 
             if decision.confirmed:
+                _audit_session(AuditEventType.CONFIRMATION_ACCEPTED, context, session)
                 if session.pending_action == UPDATE_INCIDENT_ACTION:
                     # BL-009: validate → authorize → EXECUTING → Tool Gateway.
                     await _update_confirmed_incident(context, user_id, session)
@@ -232,6 +252,7 @@ async def on_message(context):
                 return
 
             elif decision.cancelled:
+                _audit_session(AuditEventType.CONFIRMATION_CANCELLED, context, session)
                 # Transition to CANCELLED, then reset to IDLE.
                 session.transition_to(ConversationPhase.CANCELLED)
                 session.transition_to(ConversationPhase.IDLE)
@@ -245,6 +266,10 @@ async def on_message(context):
 
             else:
                 # Ambiguous — remain in READY_FOR_CONFIRMATION and re-prompt.
+                _audit_session(
+                    AuditEventType.CONFIRMATION_REJECTED, context, session,
+                    reason="not_explicit_confirmation",
+                )
                 await context.send(
                     "I need an explicit confirmation or cancellation before "
                     "I can proceed.\n\n"
@@ -357,7 +382,12 @@ async def on_message(context):
                 ConversationPhase.CANCELLED,
             ):
                 collection = start_incident_collection(session, user_message)
+                session.correlation_id = _audit_request_id()
                 save_session(user_id, session)
+
+                _audit_session(AuditEventType.INCIDENT_CREATE_REQUESTED, context, session)
+                if collection.ready:
+                    _audit_session(AuditEventType.CONFIRMATION_REQUESTED, context, session)
 
                 response = collection.reply
 
@@ -427,6 +457,73 @@ async def on_message(context):
 
 
 # ============================================================
+# BL-010: AUDIT HELPERS (observation only — never gate anything)
+# ============================================================
+
+_AUDIT_REQUEST_ID: contextvars.ContextVar = contextvars.ContextVar(
+    "audit_request_id", default=None
+)
+
+_PENDING_AUDIT_ACTIONS = {
+    CREATE_INCIDENT_ACTION: AuthorizableAction.CREATE_INCIDENT,
+    UPDATE_INCIDENT_ACTION: AuthorizableAction.UPDATE_INCIDENT,
+}
+
+
+def _audit_request_id() -> str:
+    request_id = _AUDIT_REQUEST_ID.get()
+    if request_id is None:
+        request_id = new_correlation_id()
+        _AUDIT_REQUEST_ID.set(request_id)
+    return request_id
+
+
+def _audit(event_type, context, *, correlation_id=None, **fields) -> None:
+    """
+    Record one audit event for the current Teams message.  Identity refs are
+    taken from the activity (stable user id + tenant id only — never the
+    display name, e-mail, message text or payloads).  Never raises.
+    """
+    try:
+        activity = context.activity
+        identity = _identity_module.resolve_identity(
+            activity, channel_tenant_id=_channel_tenant_id(activity)
+        )
+        user_ref = safe_ref(identity.user_id)
+        tenant_ref = safe_ref(identity.tenant_id)
+        conv_ref = conversation_ref(
+            getattr(getattr(activity, "conversation", None), "id", None)
+        )
+    except Exception:  # noqa: BLE001 — audit must never break the request
+        user_ref = tenant_ref = conv_ref = None
+    request_id = _audit_request_id()
+    audit_logger.record(
+        event_type,
+        correlation_id=safe_ref(correlation_id) or request_id,
+        request_id=request_id,
+        user_id=user_ref,
+        tenant_id=tenant_ref,
+        conversation_ref=conv_ref,
+        **fields,
+    )
+
+
+def _audit_session(event_type, context, session, **fields) -> None:
+    """Audit event for the operation pending in *session*."""
+    fields.setdefault("action", _PENDING_AUDIT_ACTIONS.get(session.pending_action))
+    if session.pending_action == UPDATE_INCIDENT_ACTION:
+        fields.setdefault("incident_number", safe_incident_number(session.incident_number))
+    _audit(event_type, context, correlation_id=session.correlation_id, **fields)
+
+
+def _failure_reason(tool_result) -> str:
+    code = (tool_result.error_code or "execution_error").lower()
+    return code if code in (
+        "not_found", "execution_error", "validation_error", "authorization_denied",
+    ) else "execution_error"
+
+
+# ============================================================
 # BL-007: CONFIRMED INCIDENT CREATION
 # ============================================================
 
@@ -463,6 +560,10 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
             "for user=%r",
             user_id,
         )
+        _audit_session(
+            AuditEventType.INCIDENT_CREATE_FAILED, context, session,
+            action=AuthorizableAction.CREATE_INCIDENT, reason="invalid_details",
+        )
         session.transition_to(ConversationPhase.CANCELLED)
         session.transition_to(ConversationPhase.IDLE)
         save_session(user_id, session)
@@ -480,6 +581,7 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
         channel_tenant_id=_channel_tenant_id(context.activity),
     )
     authz = authorize(identity, AuthorizableAction.CREATE_INCIDENT)
+    correlation_id = session.correlation_id or _audit_request_id()
 
     if not authz.allowed:
         logger.warning(
@@ -487,12 +589,21 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
             identity.user_id,
             AuthorizableAction.CREATE_INCIDENT.value,
         )
+        _audit(
+            AuditEventType.INCIDENT_CREATE_DENIED, context,
+            correlation_id=correlation_id, action=AuthorizableAction.CREATE_INCIDENT,
+        )
         await context.send(
             "⛔ You are not authorised to perform this action.\n\n"
             "Please contact your IT administrator if you believe "
             "this is incorrect."
         )
         return
+
+    _audit(
+        AuditEventType.INCIDENT_CREATE_AUTHORIZED, context,
+        correlation_id=correlation_id, action=AuthorizableAction.CREATE_INCIDENT,
+    )
 
     tool_request = CreateIncidentToolRequest(**payload)
 
@@ -507,6 +618,7 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
             authz,
             ServiceNowToolAction.CREATE_INCIDENT,
             tool_request,
+            correlation_id=correlation_id,
         )
     except Exception as exc:
         logger.error(
@@ -524,6 +636,12 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
         session.incident_number = tool_result.incident_number or None
         session.transition_to(ConversationPhase.COMPLETED)
         save_session(user_id, session)
+        _audit(
+            AuditEventType.INCIDENT_CREATE_COMPLETED, context,
+            correlation_id=correlation_id, action=AuthorizableAction.CREATE_INCIDENT,
+            tool=ServiceNowToolAction.CREATE_INCIDENT.value,
+            incident_number=safe_incident_number(session.incident_number),
+        )
 
         if session.incident_number:
             await context.send(
@@ -543,6 +661,12 @@ async def _create_confirmed_incident(context, user_id: str, session) -> None:
     session.last_error = tool_result.safe_message
     session.transition_to(ConversationPhase.FAILED)
     save_session(user_id, session)
+    _audit(
+        AuditEventType.INCIDENT_CREATE_FAILED, context,
+        correlation_id=correlation_id, action=AuthorizableAction.CREATE_INCIDENT,
+        tool=ServiceNowToolAction.CREATE_INCIDENT.value,
+        reason=_failure_reason(tool_result),
+    )
 
     await context.send(
         f"❌ The incident could not be created: {tool_result.safe_message}\n\n"
@@ -562,6 +686,14 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
     identity → authorize(READ_INCIDENT) → gateway GET_INCIDENT (once, never
     retried).  Returns a safe message for denial, not-found and failure.
     """
+    correlation_id = _audit_request_id()
+    read = dict(
+        correlation_id=correlation_id,
+        action=AuthorizableAction.READ_INCIDENT,
+        incident_number=safe_incident_number(incident_number),
+    )
+    _audit(AuditEventType.INCIDENT_READ_REQUESTED, context, **read)
+
     identity = resolve_identity(
         context.activity,
         channel_tenant_id=_channel_tenant_id(context.activity),
@@ -574,7 +706,11 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
             identity.user_id,
             AuthorizableAction.READ_INCIDENT.value,
         )
+        _audit(AuditEventType.INCIDENT_READ_DENIED, context, **read)
         return NOT_AUTHORISED_MESSAGE
+
+    _audit(AuditEventType.INCIDENT_READ_AUTHORIZED, context, **read)
+    read["tool"] = ServiceNowToolAction.GET_INCIDENT.value
 
     try:
         tool_result = await servicenow_gateway.execute(
@@ -582,6 +718,7 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
             authz,
             ServiceNowToolAction.GET_INCIDENT,
             GetIncidentToolRequest(incident_number=incident_number),
+            correlation_id=correlation_id,
         )
     except Exception as exc:
         logger.error(
@@ -589,10 +726,18 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
             type(exc).__name__,
             identity.user_id,
         )
+        _audit(AuditEventType.INCIDENT_READ_FAILED, context, reason="execution_error", **read)
         return lookup_failed_message(incident_number)
 
     if tool_result.success and tool_result.incident:
+        _audit(AuditEventType.INCIDENT_READ_COMPLETED, context, **read)
         return format_incident_status(tool_result.incident, incident_number)
+
+    _audit(
+        AuditEventType.INCIDENT_READ_FAILED, context,
+        reason=_failure_reason(tool_result) if not tool_result.success else "empty_result",
+        **read,
+    )
 
     if tool_result.error_code == "NOT_FOUND":
         return not_found_message(incident_number)
@@ -629,7 +774,20 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
     if command is None:  # pragma: no cover — the router already matched
         return "I didn't understand that update request."
 
+    correlation_id = _audit_request_id()
+    number = command.incident_number
+    upd = dict(
+        correlation_id=correlation_id,
+        action=AuthorizableAction.UPDATE_INCIDENT,
+        incident_number=safe_incident_number(number),
+    )
+    _audit(AuditEventType.INCIDENT_UPDATE_REQUESTED, context, **upd)
+
     if command.unsupported:
+        _audit(
+            AuditEventType.INCIDENT_UPDATE_FAILED, context,
+            outcome=AuditOutcome.REJECTED, reason="unsupported_field", **upd,
+        )
         return unsupported_fields_message(command.unsupported)
 
     identity = resolve_identity(
@@ -642,19 +800,26 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
             identity.user_id,
             AuthorizableAction.UPDATE_INCIDENT.value,
         )
+        _audit(AuditEventType.INCIDENT_UPDATE_DENIED, context, reason="request_stage", **upd)
         return _NOT_AUTHORISED_ACTION
+    _audit(AuditEventType.INCIDENT_UPDATE_AUTHORIZED, context, reason="request_stage", **upd)
 
+    # The current-value read is an incident read in its own right.
+    read = dict(upd, action=AuthorizableAction.READ_INCIDENT)
     read_authz = authorize(identity, AuthorizableAction.READ_INCIDENT)
     if not read_authz.allowed:
+        _audit(AuditEventType.INCIDENT_READ_DENIED, context, **read)
         return _NOT_AUTHORISED_ACTION
+    _audit(AuditEventType.INCIDENT_READ_AUTHORIZED, context, **read)
+    read["tool"] = ServiceNowToolAction.GET_INCIDENT.value
 
-    number = command.incident_number
     try:
         read_result = await servicenow_gateway.execute(
             identity,
             read_authz,
             ServiceNowToolAction.GET_INCIDENT,
             GetIncidentToolRequest(incident_number=number),
+            correlation_id=correlation_id,
         )
     except Exception as exc:
         logger.error(
@@ -662,12 +827,19 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
             type(exc).__name__,
             identity.user_id,
         )
+        _audit(AuditEventType.INCIDENT_READ_FAILED, context, reason="execution_error", **read)
         return lookup_failed_message(number)
 
     if not read_result.success or not read_result.incident:
+        _audit(
+            AuditEventType.INCIDENT_READ_FAILED, context,
+            reason=_failure_reason(read_result) if not read_result.success else "empty_result",
+            **read,
+        )
         if read_result.error_code == "NOT_FOUND":
             return not_found_message(number)
         return lookup_failed_message(number)
+    _audit(AuditEventType.INCIDENT_READ_COMPLETED, context, **read)
 
     # The read above awaited, so another message may have changed this
     # user's conversation meanwhile.  Fail closed: never overwrite it.
@@ -683,12 +855,19 @@ async def _start_incident_update(context, user_id: str, session, user_message: s
             "for user=%r",
             user_id,
         )
+        _audit(
+            AuditEventType.INCIDENT_UPDATE_FAILED, context,
+            outcome=AuditOutcome.REJECTED, reason="conversation_changed", **upd,
+        )
         return _REQUEST_IN_PROGRESS
 
     result = start_update_collection(
         session, command, current_values(read_result.incident)
     )
+    session.correlation_id = correlation_id
     save_session(user_id, session)
+    if result.ready:
+        _audit_session(AuditEventType.CONFIRMATION_REQUESTED, context, session)
     return result.reply
 
 
@@ -707,6 +886,11 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
             session.phase.value,
             user_id,
         )
+        _audit_session(
+            AuditEventType.INCIDENT_UPDATE_FAILED, context, session,
+            action=AuthorizableAction.UPDATE_INCIDENT,
+            outcome=AuditOutcome.REJECTED, reason="not_awaiting_confirmation",
+        )
         await context.send(_REQUEST_IN_PROGRESS)
         return
 
@@ -716,6 +900,11 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
         logger.warning(
             "incident update blocked: pending update missing or invalid for user=%r",
             user_id,
+        )
+        _audit_session(
+            AuditEventType.INCIDENT_UPDATE_FAILED, context, session,
+            action=AuthorizableAction.UPDATE_INCIDENT,
+            outcome=AuditOutcome.REJECTED, reason="invalid_details",
         )
         session.transition_to(ConversationPhase.CANCELLED)
         session.transition_to(ConversationPhase.IDLE)
@@ -732,6 +921,11 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
         channel_tenant_id=_channel_tenant_id(context.activity),
     )
     authz = authorize(identity, AuthorizableAction.UPDATE_INCIDENT)
+    upd = dict(
+        correlation_id=session.correlation_id or _audit_request_id(),
+        action=AuthorizableAction.UPDATE_INCIDENT,
+        incident_number=safe_incident_number(number),
+    )
 
     if not authz.allowed:
         logger.warning(
@@ -739,8 +933,11 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
             identity.user_id,
             AuthorizableAction.UPDATE_INCIDENT.value,
         )
+        _audit(AuditEventType.INCIDENT_UPDATE_DENIED, context, reason="execution_stage", **upd)
         await context.send(_NOT_AUTHORISED_ACTION)
         return
+    _audit(AuditEventType.INCIDENT_UPDATE_AUTHORIZED, context, reason="execution_stage", **upd)
+    upd["tool"] = ServiceNowToolAction.UPDATE_INCIDENT.value
 
     tool_request = UpdateIncidentToolRequest(incident_number=number, **changes)
 
@@ -755,6 +952,7 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
             authz,
             ServiceNowToolAction.UPDATE_INCIDENT,
             tool_request,
+            correlation_id=upd["correlation_id"],
         )
     except Exception as exc:
         logger.error(
@@ -771,6 +969,7 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
     if tool_result.success:
         session.transition_to(ConversationPhase.COMPLETED)
         save_session(user_id, session)
+        _audit(AuditEventType.INCIDENT_UPDATE_COMPLETED, context, **upd)
 
         if tool_result.incident:
             await context.send(
@@ -789,6 +988,10 @@ async def _update_confirmed_incident(context, user_id: str, session) -> None:
     session.last_error = tool_result.safe_message
     session.transition_to(ConversationPhase.FAILED)
     save_session(user_id, session)
+    _audit(
+        AuditEventType.INCIDENT_UPDATE_FAILED, context,
+        reason=_failure_reason(tool_result), **upd,
+    )
 
     await context.send(
         f"❌ The update to {number} could not be applied: "

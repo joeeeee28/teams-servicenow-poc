@@ -22,6 +22,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
+from app.audit import (
+    AuditEventType,
+    AuditLogger,
+    audit_logger as _default_audit_logger,
+    safe_incident_number,
+    safe_ref,
+)
 from app.security.authorization import AuthorizableAction, AuthorizationDecision
 from app.security.identity import UserIdentity
 from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
@@ -324,7 +331,11 @@ class ServiceNowToolGateway:
       - Typed request contract validation
     """
 
-    def __init__(self, client: Optional[ServiceNowClient] = None) -> None:
+    def __init__(
+        self,
+        client: Optional[ServiceNowClient] = None,
+        audit_logger: Optional[AuditLogger] = None,
+    ) -> None:
         """
         Initialize the Tool Gateway.
 
@@ -332,8 +343,11 @@ class ServiceNowToolGateway:
         ----------
         client: Optional[ServiceNowClient]
             ServiceNow adapter instance. If None, lazy-initializes on execution.
+        audit_logger: Optional[AuditLogger]
+            BL-010 audit sink for gateway rejections (default: app audit logger).
         """
         self._client = client
+        self._audit = audit_logger or _default_audit_logger
 
     def _get_client(self) -> ServiceNowClient:
         """Get or initialize the underlying ServiceNowClient adapter."""
@@ -420,6 +434,7 @@ class ServiceNowToolGateway:
 
         except ToolGatewayError as err:
             logger.warning("gateway error: action=%r code=%r message=%r", tool_action, err.error_code, err.message)
+            self._audit_rejection(err, identity, tool_action, request, correlation_id)
             if raise_on_error:
                 raise
             return ToolResult.fail(
@@ -438,6 +453,43 @@ class ServiceNowToolGateway:
                 safe_message=err.message,
                 error_code=err.error_code,
             )
+
+    def _audit_rejection(
+        self,
+        err: "ToolGatewayError",
+        identity: Any,
+        tool_action: Any,
+        request: Any,
+        correlation_id: Optional[str],
+    ) -> None:
+        """
+        BL-010: record a request the gateway itself refused.  Observation only
+        — the rejection has already been decided and is returned unchanged.
+        NOT_FOUND / EXECUTION_ERROR are execution failures, audited by the
+        caller that owns the operation.
+        """
+        if err.error_code == "AUTHORIZATION_DENIED":
+            event_type = AuditEventType.AUTHORIZATION_DENIED
+            reason = "authorization_denied"
+        elif err.error_code == "VALIDATION_ERROR":
+            event_type = AuditEventType.TOOL_EXECUTION_REJECTED
+            reason = "validation_error"
+        else:
+            return
+        known_tool = isinstance(tool_action, ServiceNowToolAction)
+        if not known_tool:
+            reason = "invalid_tool_action"
+        is_identity = isinstance(identity, UserIdentity)
+        self._audit.record(
+            event_type,
+            correlation_id=safe_ref(correlation_id),
+            action=_ACTION_MAPPING.get(tool_action) if known_tool else None,
+            tool=tool_action.value if known_tool else None,
+            user_id=safe_ref(identity.user_id) if is_identity else None,
+            tenant_id=safe_ref(identity.tenant_id) if is_identity else None,
+            incident_number=safe_incident_number(getattr(request, "incident_number", None)),
+            reason=reason,
+        )
 
     async def _execute_get_incident(
         self,

@@ -32,7 +32,9 @@ FastAPI (app/main.py)
         │
         ├─► [BL-004] Identity-aware Authorization
         │
-        └─► [BL-005] ServiceNow Tool Gateway (app/servicenow.py)
+        ├─► [BL-005] ServiceNow Tool Gateway (app/servicenow.py)
+        │
+        └─► [BL-010] Audit logging (app/audit.py) — observation only
 ```
 
 ---
@@ -669,6 +671,60 @@ EXECUTING → gateway UPDATE_INCIDENT (UpdateIncidentToolRequest), once, no retr
   progress". The existing conversation is left intact. The executor also
   refuses to run unless the phase is still READY_FOR_CONFIRMATION, and in
   that case skips identity, authorization and the gateway.
+
+---
+
+## BL-010 — Audit Logging
+
+`app/audit.py` records security-relevant actions as structured JSON events
+on the dedicated `app.audit` logger. Audit logging is **observation only**.
+It is not an authorization mechanism and not an execution mechanism. It never
+grants or denies access, never executes a tool, and never changes an
+operation's result.
+
+```
+Teams request (one request_id per message: activity.id if safe, else UUID)
+   │
+   ├─ *_REQUESTED                           (operation starts; correlation_id = its request_id)
+   ▼
+identity → authorization ──► *_AUTHORIZED / *_DENIED
+   ▼
+confirmation (writes only) ─► CONFIRMATION_REQUESTED / _ACCEPTED / _CANCELLED / _REJECTED
+   ▼
+Tool Gateway ──────────────► AUTHORIZATION_DENIED / TOOL_EXECUTION_REJECTED   (gateway's own guards)
+   ▼
+ServiceNow ────────────────► *_COMPLETED only after ServiceNow confirms success, else *_FAILED
+```
+
+- **Event types (21):** `incident_{read,create,update}_{requested,authorized,
+  denied,completed,failed}`, `confirmation_{requested,accepted,cancelled,
+  rejected}`, `authorization_denied` and `tool_execution_rejected`. Each type
+  allows only matching `AuditOutcome` values.
+- **Fields:** `timestamp` (UTC), `event_type`, `outcome`, `correlation_id`,
+  and optionally `action`, `request_id`, `user_id` (AAD object id),
+  `tenant_id`, `conversation_ref` (SHA-256 prefix of the conversation id),
+  `incident_number`, `tool` and `reason` (a `snake_case` code).
+- **Privacy by construction.** `AuditEvent` has no free-text field. Every
+  value is an enum, a validated identifier or a reason code, and anything
+  else is rejected at construction. Messages, incident descriptions, LLM
+  prompts and completions, ServiceNow payloads, tokens, headers, display
+  names and e-mail addresses cannot appear in an audit record.
+- **Ownership.** `app/main.py` owns the operation, authorization,
+  confirmation and outcome events. `ServiceNowToolGateway` owns
+  `authorization_denied` and `tool_execution_rejected` for requests its own
+  guards refuse. `not_found` and `execution_error` are reported by the
+  caller as `*_failed`.
+- **Correlation.** A create or update spans several Teams messages. Its
+  `correlation_id` is stored in `ConversationState.correlation_id` and
+  cleared on reset to IDLE, so every event of one operation shares it. A read
+  uses its request id.
+- **Failure policy.** `AuditLogger.record()` never raises. A failed event is
+  dropped and reported on the sibling `app.audit_errors` logger (exception
+  type only), so the `app.audit` channel carries only JSON events. Security
+  decisions never depend on audit, so an audit failure cannot bypass
+  authorization or confirmation, and cannot turn a failure into a success.
+- **Destination.** Standard Python logging only. There is no database, SIEM
+  or cloud sink yet.
 
 ---
 
