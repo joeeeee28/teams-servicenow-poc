@@ -295,6 +295,14 @@ class _HandlerHarness(unittest.IsolatedAsyncioTestCase):
     create_result: object = {"number": "REQ0012345", "sys_id": RETURNED_SYS_ID}
 
     async def asyncSetUp(self):
+        # Isolate from a developer's local SERVICENOW_CATALOG_SYS_IDS (loaded
+        # from .env): these tests expect the fixture catalog unless a test sets
+        # the mapping itself.  patch.dict restores os.environ after each test.
+        isolated_env = patch.dict(os.environ)
+        isolated_env.start()
+        self.addCleanup(isolated_env.stop)
+        os.environ.pop("SERVICENOW_CATALOG_SYS_IDS", None)
+
         previous_store = get_state_repository()
         self.addCleanup(configure_state_repository, previous_store)
         configure_state_repository(InMemoryStateRepository())
