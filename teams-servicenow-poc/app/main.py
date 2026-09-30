@@ -28,6 +28,7 @@ from app.servicenow import (
     ServiceNowClient,
     ServiceNowError,
     ServiceNowNotFound,
+    catalog_sys_ids_from_env,
 )
 from app.confirmation import ConfirmationDecision, evaluate_confirmation
 from app.incident_collection import (
@@ -358,7 +359,7 @@ async def _handle_message(context):
             elif session.pending_action == CREATE_REQUEST_ACTION:
                 # DEMO-06: collecting a catalog request.
                 item_ref = session.collected_details.get("item_ref")
-                item = LocalCatalogRepository.from_fixture().get_item_by_ref(item_ref) if item_ref else None
+                item = LocalCatalogRepository.from_fixture(catalog_sys_ids_from_env()).get_item_by_ref(item_ref) if item_ref else None
                 if item:
                     collection = process_request_collection_message(session, item, user_message)
                 else:
@@ -639,7 +640,7 @@ async def _handle_message(context):
                             ConversationPhase.FAILED,
                             ConversationPhase.CANCELLED,
                         ):
-                            item = LocalCatalogRepository.from_fixture().get_item_by_ref(top_entry.item_ref)
+                            item = LocalCatalogRepository.from_fixture(catalog_sys_ids_from_env()).get_item_by_ref(top_entry.item_ref)
                             if item:
                                 collection = start_request_collection(session, item, user_message)
                                 session.correlation_id = _audit_request_id()

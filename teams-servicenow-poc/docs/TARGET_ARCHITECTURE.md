@@ -1437,6 +1437,32 @@ Response & Audit (COMPLETED / FAILED → IDLE)
 - **Ambiguous Write Handling**: On timeout or transport failure after POST transmission, state transitions to `FAILED → IDLE` and audits `UNKNOWN_OUTCOME`. The gateway does not automatically retry request creation.
 - **Data Privacy**: Audit events record `item_ref` (e.g. `CAT0001`) and `request_number` (e.g. `REQ0010001`). Raw `sys_id`s and variable text values are **never** written to audit logs.
 
+### Live ServiceNow configuration
+
+The approved catalog fixture (`app/catalog/fixture.py`) ships with **placeholder**
+`sys_id`s. To order against a real instance, map each catalog item you want to
+use to that instance's catalog item `sys_id`:
+
+```
+SERVICENOW_CATALOG_SYS_IDS=CAT0001=<32-hex sys_id>,CAT0006=<32-hex sys_id>
+```
+
+- Parsed by `app.servicenow.catalog_sys_ids_from_env()`. Each entry must be
+  `CAT` + 4 digits `=` 32 lower-case hex characters; any other entry is
+  ignored and logged by position only.
+- Applied by `LocalCatalogRepository.from_fixture(sys_ids)`. An item without a
+  valid entry keeps its placeholder. Ordering it reaches ServiceNow, which
+  rejects it, and the user gets the controlled ❌ "No change was made" reply.
+- The display name, description and variables still come from the approved
+  fixture. `sys_id`s are internal only: they are sent to `order_now` and
+  persisted while a request is in progress, and never shown to users.
+- `sys_id`s are instance-specific and are configured per environment (for
+  example in `.env`), never committed.
+- The ServiceNow integration user must be allowed to use the Service Catalog
+  REST API (`/api/sn_sc/v1/servicecatalog/...`) and to order the mapped items.
+  Otherwise ServiceNow returns 403 and the user gets the controlled ❌ "isn't
+  permitted" reply.
+
 ---
 
 ## Security Notes (all layers)

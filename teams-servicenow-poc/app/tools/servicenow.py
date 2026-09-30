@@ -48,7 +48,12 @@ from app.catalog import (
     CatalogUnavailableError,
     LocalCatalogRepository,
 )
-from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowNotFound
+from app.servicenow import (
+    ServiceNowClient,
+    ServiceNowError,
+    ServiceNowNotFound,
+    catalog_sys_ids_from_env,
+)
 from app.servicenow_errors import ServiceNowErrorCategory, failure_message
 
 logger = logging.getLogger(__name__)
@@ -496,7 +501,7 @@ class ServiceNowToolGateway:
     def _get_catalog(self) -> CatalogService:
         """The approved catalog behind SEARCH_CATALOG (POC: local fixture)."""
         if self._catalog is None:
-            self._catalog = LocalCatalogRepository.from_fixture()
+            self._catalog = LocalCatalogRepository.from_fixture(catalog_sys_ids_from_env())
         return CatalogService(self._catalog)
 
     def _get_client(self) -> ServiceNowClient:

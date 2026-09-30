@@ -19,9 +19,9 @@ from __future__ import annotations
 import abc
 import logging
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
-from app.catalog.models import CatalogItem, CatalogSearchRequest
+from app.catalog.models import ITEM_REF_RE, SYS_ID_RE, CatalogItem, CatalogSearchRequest
 from app.knowledge.models import tokenize
 
 logger = logging.getLogger(__name__)
@@ -95,10 +95,26 @@ class LocalCatalogRepository(CatalogRepository):
         return cls(items)
 
     @classmethod
-    def from_fixture(cls) -> "LocalCatalogRepository":
+    def from_fixture(cls, sys_ids: Optional[Mapping[str, str]] = None) -> "LocalCatalogRepository":
+        """
+        The approved POC catalog.  *sys_ids* optionally maps ``item_ref`` →
+        the real ServiceNow catalog item ``sys_id`` for this instance (from
+        configuration; see ``app.servicenow.catalog_sys_ids_from_env``).
+        Entries that are not a known ref / valid 32-hex sys_id are ignored,
+        so the fixture placeholder stays in place.  sys_ids are never shown
+        to users.
+        """
         from app.catalog.fixture import CATALOG_RECORDS
 
-        return cls.from_records(CATALOG_RECORDS)
+        overrides = {
+            ref: sys_id for ref, sys_id in (sys_ids or {}).items()
+            if isinstance(ref, str) and ITEM_REF_RE.fullmatch(ref)
+            and isinstance(sys_id, str) and SYS_ID_RE.fullmatch(sys_id)
+        }
+        records = [dict(record, sys_id=overrides[record["item_ref"]])
+                   if record.get("item_ref") in overrides else record
+                   for record in CATALOG_RECORDS]
+        return cls.from_records(records)
 
     async def search(self, request: CatalogSearchRequest) -> Sequence[RankedItem]:
         if not isinstance(request, CatalogSearchRequest):

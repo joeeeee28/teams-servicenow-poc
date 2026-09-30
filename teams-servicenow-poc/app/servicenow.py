@@ -95,6 +95,30 @@ _ERROR_CLASSES: dict[ServiceNowErrorCategory, type[ServiceNowError]] = {
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 _SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_ITEM_REF_RE = re.compile(r"^CAT[0-9]{4}$")
+
+# DEMO-06: real ServiceNow catalog item sys_ids for this instance, e.g.
+#   SERVICENOW_CATALOG_SYS_IDS=CAT0001=<32-hex sys_id>,CAT0006=<32-hex sys_id>
+# Items without an entry keep the fixture placeholder (ordering them fails
+# safely with a controlled ❌ reply).
+CATALOG_SYS_IDS_ENV = "SERVICENOW_CATALOG_SYS_IDS"
+
+
+def catalog_sys_ids_from_env() -> dict[str, str]:
+    """
+    Validated ``item_ref`` → ``sys_id`` map from ``SERVICENOW_CATALOG_SYS_IDS``.
+    Malformed entries are ignored and logged by position only.
+    """
+    raw = os.getenv(CATALOG_SYS_IDS_ENV, "") or ""
+    mapping: dict[str, str] = {}
+    for position, entry in enumerate(p for p in raw.split(",") if p.strip()):
+        ref, sep, sys_id = (part.strip() for part in entry.partition("="))
+        if sep and _ITEM_REF_RE.fullmatch(ref) and _SYS_ID_RE.fullmatch(sys_id):
+            mapping[ref] = sys_id
+        else:
+            logger.warning("%s: ignored invalid entry at position %d",
+                           CATALOG_SYS_IDS_ENV, position)
+    return mapping
 
 
 def _http_error(status_code: int, *, what: str, write_sent: bool) -> ServiceNowError:

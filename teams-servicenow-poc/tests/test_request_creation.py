@@ -626,6 +626,82 @@ class TestExecutingGuard(_HandlerHarness):
         self.client.create_service_request.assert_not_called()
 
 
+CONFIGURED_SYS_ID = "0123456789abcdef0123456789abcdef"  # synthetic test value
+
+
+class TestCatalogConfiguration(_HandlerHarness):
+    """SERVICENOW_CATALOG_SYS_IDS maps catalog refs to real instance sys_ids."""
+
+    def _env(self, value):
+        p = patch.dict(os.environ, {"SERVICENOW_CATALOG_SYS_IDS": value})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_parse_accepts_only_valid_entries(self):
+        from app.servicenow import catalog_sys_ids_from_env
+
+        other = "fedcba9876543210fedcba9876543210"
+        self._env(f" CAT0001 = {CONFIGURED_SYS_ID} , garbage, CAT9={other}, "
+                  f"CAT0006=NOT-A-SYS-ID, CAT0002={other}, INC0010002={other},")
+        with self.assertLogs("app.servicenow", level="WARNING") as logs:
+            mapping = catalog_sys_ids_from_env()
+        self.assertEqual(mapping, {"CAT0001": CONFIGURED_SYS_ID, "CAT0002": other})
+        self.assertEqual(len(logs.output), 4)
+        self.assertNotIn("NOT-A-SYS-ID", "\n".join(logs.output))
+
+    def test_missing_or_empty_configuration(self):
+        from app.servicenow import catalog_sys_ids_from_env
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SERVICENOW_CATALOG_SYS_IDS", None)
+            self.assertEqual(catalog_sys_ids_from_env(), {})
+        self._env("")
+        self.assertEqual(catalog_sys_ids_from_env(), {})
+
+    def test_fixture_applies_only_valid_overrides(self):
+        repo = LocalCatalogRepository.from_fixture(
+            {"CAT0001": CONFIGURED_SYS_ID, "CAT0002": "bad", "CAT9999": CONFIGURED_SYS_ID})
+        self.assertEqual(repo.get_item_by_ref("CAT0001").sys_id, CONFIGURED_SYS_ID)
+        self.assertEqual(repo.get_item_by_ref("CAT0001").name, "Microsoft Visio")
+        # Invalid override ignored: the item keeps its placeholder, still listed.
+        self.assertEqual(repo.get_item_by_ref("CAT0002").sys_id,
+                         LocalCatalogRepository.from_fixture().get_item_by_ref("CAT0002").sys_id)
+        self.assertEqual(LocalCatalogRepository.from_fixture().get_item_by_ref("CAT0001").sys_id,
+                         VISIO_SYS_ID)
+
+    async def test_configured_sys_id_is_sent_but_never_shown(self):
+        self._env(f"CAT0001={CONFIGURED_SYS_ID}")
+        replies = [await self._send("I need Microsoft Visio")]
+        for answer in VISIO_TURNS:
+            replies.append(await self._send(answer))
+        replies.append(await self._send("yes"))
+        self.client.create_service_request.assert_awaited_once()
+        self.assertEqual(self.client.create_service_request.await_args.kwargs["sys_id"],
+                         CONFIGURED_SYS_ID)
+        self.assertIn("REQ0012345", replies[-1])
+        for reply in replies:
+            self.assertNotIn(CONFIGURED_SYS_ID, reply)
+            self.assertNotIn(VISIO_SYS_ID, reply)
+
+    async def test_invalid_configuration_fails_safely(self):
+        from app.servicenow import ServiceNowNotFound
+
+        self._env("CAT0001=not-a-real-sys-id")
+        self.client.create_service_request.side_effect = ServiceNowNotFound("404")
+        await self._ready()
+        reply = await self._send("yes")
+        # The invalid value is never used: the placeholder is sent, ServiceNow
+        # rejects it, and the user gets the controlled "no change" reply.
+        self.assertEqual(self.client.create_service_request.await_args.kwargs["sys_id"],
+                         VISIO_SYS_ID)
+        self.assertTrue(reply.startswith("❌"))
+        self.assertIn("No change was made", reply)
+        for leaked in ("not-a-real-sys-id", VISIO_SYS_ID, "404", "REQ"):
+            self.assertNotIn(leaked, reply)
+        await self._send("yes")
+        self.client.create_service_request.assert_awaited_once()
+
+
 class TestRequestUncertainOutcome(_HandlerHarness):
 
     def test_unknown_write_operation_never_raises(self):
