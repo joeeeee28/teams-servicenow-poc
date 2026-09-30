@@ -1334,6 +1334,7 @@ async def _create_confirmed_request(context, user_id: str, session) -> None:
 
     if tool_result.success:
         req_num = tool_result.request_number  # validated REQ number, or None
+        ritm_num = tool_result.ritm_number    # validated RITM number, or None
         session.transition_to(ConversationPhase.COMPLETED)
         _audit(
             AuditEventType.REQUEST_CREATE_COMPLETED, context,
@@ -1344,8 +1345,9 @@ async def _create_confirmed_request(context, user_id: str, session) -> None:
         save_session(_state_key(context.activity), session)
 
         if req_num:
+            ritm_text = f" (Item: **{ritm_num}**)" if ritm_num else ""
             await context.send(
-                f"✅ Request **{req_num}** has been created successfully for **{item_name}**.\n\n"
+                f"✅ Request **{req_num}**{ritm_text} has been created successfully for **{item_name}** for **{user_email_or_upn}**.\n\n"
                 "Thank you!"
             )
         else:

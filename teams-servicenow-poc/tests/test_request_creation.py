@@ -862,19 +862,34 @@ class TestPhase1RequestedForResolution(_HandlerHarness):
             with self.assertRaises(ServiceNowUserLookupFailed):
                 await client.get_user_by_email_or_upn("error@example.com")
 
-    async def test_create_service_request_includes_sysparm_requested_for(self):
+    async def test_create_service_request_uses_post_creation_patch_flow(self):
         from app.servicenow import ServiceNowClient
         client = ServiceNowClient()
-        mock_request = AsyncMock(return_value={"result": {"number": "REQ0010001"}})
+        req_sys_id = "dc1d9ddbc3e7039084ac58e1b4013172"
+        ritm_sys_id = "981d9ddbc3e7039084ac58e1b4013173"
+        target_user_sys_id = "02826bf03710200044e0bfc8bcbe5d3f"
+
+        mock_responses = [
+            {"result": {"sys_id": req_sys_id, "number": "REQ0010004"}}, # order_now POST
+            {"result": [{"sys_id": ritm_sys_id, "number": "RITM0010004"}]}, # get_ritm GET
+            {"result": {"sys_id": req_sys_id}}, # PATCH sc_request
+            {"result": {"sys_id": ritm_sys_id}}, # PATCH sc_req_item
+            {"result": {"sys_id": req_sys_id, "requested_for": target_user_sys_id}}, # GET sc_request verify
+            {"result": {"sys_id": ritm_sys_id, "requested_for": target_user_sys_id}}, # GET sc_req_item verify
+        ]
+        mock_request = AsyncMock(side_effect=mock_responses)
         with patch.object(client, "_request", mock_request):
-            await client.create_service_request(
+            res = await client.create_service_request(
                 sys_id=ACROBAT_SYS_ID,
                 variables={"business_justification": "Test"},
-                requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f",
+                requested_for_sys_id=target_user_sys_id,
             )
-            mock_request.assert_awaited_once()
-            payload = mock_request.call_args.kwargs["json"]
-            self.assertEqual(payload["sysparm_requested_for"], "02826bf03710200044e0bfc8bcbe5d3f")
+            self.assertEqual(res["number"], "REQ0010004")
+            self.assertEqual(res["ritm_number"], "RITM0010004")
+            # First call is order_now POST without sysparm_requested_for
+            order_now_call = mock_request.await_args_list[0]
+            payload = order_now_call.kwargs["json"]
+            self.assertNotIn("sysparm_requested_for", payload)
             self.assertEqual(payload["sysparm_quantity"], "1")
 
     async def test_flow_unresolved_teams_user_no_order_now_post(self):
@@ -921,6 +936,110 @@ class TestPhase1RequestedForResolution(_HandlerHarness):
             variables={},
             requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f",
         )
+
+
+class TestPhase5PostCreationPatchRequestedFor(unittest.IsolatedAsyncioTestCase):
+    """Phase 5: Supervised live-verified post-creation PATCH requested_for flow tests."""
+
+    async def test_client_get_ritm_for_request_success(self):
+        from app.servicenow import ServiceNowClient
+        client = ServiceNowClient()
+        mock_resp = {"result": [{"sys_id": "981d9ddbc3e7039084ac58e1b4013173", "number": "RITM0010004"}]}
+        mock_req = AsyncMock(return_value=mock_resp)
+        with patch.object(client, "_request", mock_req):
+            ritm = await client.get_ritm_for_request("dc1d9ddbc3e7039084ac58e1b4013172")
+            self.assertEqual(ritm["sys_id"], "981d9ddbc3e7039084ac58e1b4013173")
+            self.assertEqual(ritm["number"], "RITM0010004")
+            mock_req.assert_awaited_once()
+
+    async def test_client_get_ritm_for_request_zero_or_multiple_failure(self):
+        from app.servicenow import ServiceNowClient, ServiceNowInvalidResponse
+        client = ServiceNowClient()
+
+        # Zero records
+        with patch.object(client, "_request", AsyncMock(return_value={"result": []})):
+            with self.assertRaises(ServiceNowInvalidResponse):
+                await client.get_ritm_for_request("dc1d9ddbc3e7039084ac58e1b4013172")
+
+        # Multiple records
+        with patch.object(client, "_request", AsyncMock(return_value={"result": [{}, {}]})):
+            with self.assertRaises(ServiceNowInvalidResponse):
+                await client.get_ritm_for_request("dc1d9ddbc3e7039084ac58e1b4013172")
+
+    async def test_client_update_request_requested_for_success(self):
+        from app.servicenow import ServiceNowClient
+        client = ServiceNowClient()
+        req_sys_id = "dc1d9ddbc3e7039084ac58e1b4013172"
+        ritm_sys_id = "981d9ddbc3e7039084ac58e1b4013173"
+        target_user_sys_id = "02826bf03710200044e0bfc8bcbe5d3f"
+
+        mock_responses = [
+            {"result": {"sys_id": req_sys_id, "requested_for": target_user_sys_id}},
+            {"result": {"sys_id": ritm_sys_id, "requested_for": target_user_sys_id}},
+            {"result": {"sys_id": req_sys_id, "requested_for": {"value": target_user_sys_id}}},
+            {"result": {"sys_id": ritm_sys_id, "requested_for": {"value": target_user_sys_id}}},
+        ]
+        mock_req = AsyncMock(side_effect=mock_responses)
+        with patch.object(client, "_request", mock_req):
+            await client.update_request_requested_for(req_sys_id, ritm_sys_id, target_user_sys_id)
+            self.assertEqual(mock_req.await_count, 4)
+            calls = mock_req.await_args_list
+            self.assertEqual(calls[0].args, ("PATCH", f"{client.instance}/api/now/table/sc_request/{req_sys_id}"))
+            self.assertEqual(calls[0].kwargs["json"], {"requested_for": target_user_sys_id})
+            self.assertEqual(calls[1].args, ("PATCH", f"{client.instance}/api/now/table/sc_req_item/{ritm_sys_id}"))
+            self.assertEqual(calls[1].kwargs["json"], {"requested_for": target_user_sys_id})
+
+    async def test_client_sc_request_patch_failure(self):
+        from app.servicenow import ServiceNowClient, ServiceNowError
+        client = ServiceNowClient()
+        req_sys_id = "dc1d9ddbc3e7039084ac58e1b4013172"
+        ritm_sys_id = "981d9ddbc3e7039084ac58e1b4013173"
+        target_user_sys_id = "02826bf03710200044e0bfc8bcbe5d3f"
+
+        mock_req = AsyncMock(side_effect=ServiceNowError("PATCH sc_request failed", status_code=500, possibly_applied=True))
+        with patch.object(client, "_request", mock_req):
+            with self.assertRaises(ServiceNowError) as cm:
+                await client.update_request_requested_for(req_sys_id, ritm_sys_id, target_user_sys_id)
+            self.assertTrue(cm.exception.possibly_applied)
+            self.assertEqual(mock_req.await_count, 1)
+
+    async def test_client_sc_req_item_patch_failure(self):
+        from app.servicenow import ServiceNowClient, ServiceNowError
+        client = ServiceNowClient()
+        req_sys_id = "dc1d9ddbc3e7039084ac58e1b4013172"
+        ritm_sys_id = "981d9ddbc3e7039084ac58e1b4013173"
+        target_user_sys_id = "02826bf03710200044e0bfc8bcbe5d3f"
+
+        mock_responses = [
+            {"result": {"sys_id": req_sys_id}},
+            ServiceNowError("PATCH sc_req_item failed", status_code=500, possibly_applied=True),
+        ]
+        mock_req = AsyncMock(side_effect=mock_responses)
+        with patch.object(client, "_request", mock_req):
+            with self.assertRaises(ServiceNowError) as cm:
+                await client.update_request_requested_for(req_sys_id, ritm_sys_id, target_user_sys_id)
+            self.assertTrue(cm.exception.possibly_applied)
+            self.assertEqual(mock_req.await_count, 2)
+
+    async def test_client_verification_failure(self):
+        from app.servicenow import ServiceNowClient, ServiceNowError
+        client = ServiceNowClient()
+        req_sys_id = "dc1d9ddbc3e7039084ac58e1b4013172"
+        ritm_sys_id = "981d9ddbc3e7039084ac58e1b4013173"
+        target_user_sys_id = "02826bf03710200044e0bfc8bcbe5d3f"
+
+        mock_responses = [
+            {"result": {"sys_id": req_sys_id}},
+            {"result": {"sys_id": ritm_sys_id}},
+            {"result": {"sys_id": req_sys_id, "requested_for": {"value": "wrong_sys_id"}}},
+            {"result": {"sys_id": ritm_sys_id, "requested_for": {"value": target_user_sys_id}}},
+        ]
+        mock_req = AsyncMock(side_effect=mock_responses)
+        with patch.object(client, "_request", mock_req):
+            with self.assertRaises(ServiceNowError) as cm:
+                await client.update_request_requested_for(req_sys_id, ritm_sys_id, target_user_sys_id)
+            self.assertIn("requested_for verification failed", str(cm.exception))
+            self.assertTrue(cm.exception.possibly_applied)
 
 
 if __name__ == "__main__":

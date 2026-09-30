@@ -429,6 +429,130 @@ class ServiceNowClient:
 
         return sys_id
 
+    async def get_ritm_for_request(
+        self,
+        req_sys_id: str,
+    ) -> dict:
+        """
+        Query sc_req_item table for the single RITM associated with a given sc_request sys_id.
+        Validates req_sys_id as a strict 32-character hex string.
+        Fails safely if 0 or >1 RITM records are returned.
+        """
+        if not isinstance(req_sys_id, str) or not _SYS_ID_RE.fullmatch(req_sys_id):
+            raise ValueError("req_sys_id must be 32 lower-case hex characters.")
+
+        url = f"{self.instance}/api/now/table/sc_req_item"
+        params = {
+            "sysparm_query": f"request={req_sys_id}",
+            "sysparm_fields": "sys_id,number,opened_by,requested_for,request",
+            "sysparm_limit": "2",
+        }
+
+        try:
+            response = await self._request("GET", url, params=params)
+        except ServiceNowError as exc:
+            raise ServiceNowError(
+                f"RITM lookup failed: {exc}",
+                possibly_applied=True,
+                status_code=getattr(exc, "status_code", None),
+            ) from None
+
+        results = response.get("result", [])
+        if not isinstance(results, list):
+            raise ServiceNowInvalidResponse("ServiceNow RITM lookup result was not a list", possibly_applied=True)
+
+        if len(results) == 0:
+            raise ServiceNowInvalidResponse(
+                "Expected exactly one RITM record for request, but found 0",
+                possibly_applied=True,
+            )
+
+        if len(results) > 1:
+            raise ServiceNowInvalidResponse(
+                "Expected exactly one RITM record for request, but found multiple",
+                possibly_applied=True,
+            )
+
+        ritm_rec = results[0]
+        if not isinstance(ritm_rec, dict):
+            raise ServiceNowInvalidResponse("ServiceNow RITM record was not an object", possibly_applied=True)
+
+        ritm_sys_id = ritm_rec.get("sys_id")
+        if not isinstance(ritm_sys_id, str) or not _SYS_ID_RE.fullmatch(ritm_sys_id):
+            raise ServiceNowInvalidResponse("ServiceNow RITM record returned an invalid sys_id", possibly_applied=True)
+
+        return ritm_rec
+
+    @staticmethod
+    def _extract_field_value(body: dict, field_name: str) -> Optional[str]:
+        result = body.get("result", {})
+        if not isinstance(result, dict):
+            return None
+        raw = result.get(field_name)
+        if isinstance(raw, dict):
+            return raw.get("value")
+        if isinstance(raw, str):
+            return raw
+        return None
+
+    async def update_request_requested_for(
+        self,
+        req_sys_id: str,
+        ritm_sys_id: str,
+        requested_for_sys_id: str,
+    ) -> None:
+        """
+        Execute post-creation PATCH on sc_request and sc_req_item to set requested_for.
+        Validates all sys_ids as 32-character hex values.
+        Performs read-only GET verification afterwards.
+        Never retries on failure.
+        """
+        if not isinstance(req_sys_id, str) or not _SYS_ID_RE.fullmatch(req_sys_id):
+            raise ValueError("req_sys_id must be 32 lower-case hex characters.")
+        if not isinstance(ritm_sys_id, str) or not _SYS_ID_RE.fullmatch(ritm_sys_id):
+            raise ValueError("ritm_sys_id must be 32 lower-case hex characters.")
+        if not isinstance(requested_for_sys_id, str) or not _SYS_ID_RE.fullmatch(requested_for_sys_id):
+            raise ValueError("requested_for_sys_id must be 32 lower-case hex characters.")
+
+        # 1. PATCH sc_request
+        req_url = f"{self.instance}/api/now/table/sc_request/{req_sys_id}"
+        await self._request(
+            "PATCH",
+            req_url,
+            write=True,
+            json={"requested_for": requested_for_sys_id},
+        )
+
+        # 2. PATCH sc_req_item
+        ritm_url = f"{self.instance}/api/now/table/sc_req_item/{ritm_sys_id}"
+        await self._request(
+            "PATCH",
+            ritm_url,
+            write=True,
+            json={"requested_for": requested_for_sys_id},
+        )
+
+        # 3. Read-only GET verification
+        req_check = await self._request(
+            "GET",
+            req_url,
+            params={"sysparm_fields": "sys_id,requested_for"},
+        )
+        req_val = self._extract_field_value(req_check, "requested_for")
+
+        ritm_check = await self._request(
+            "GET",
+            ritm_url,
+            params={"sysparm_fields": "sys_id,requested_for"},
+        )
+        ritm_val = self._extract_field_value(ritm_check, "requested_for")
+
+        if req_val != requested_for_sys_id or ritm_val != requested_for_sys_id:
+            raise ServiceNowError(
+                "requested_for verification failed",
+                possibly_applied=True,
+            )
+
     async def create_service_request(
         self,
         sys_id: str,
@@ -442,6 +566,9 @@ class ServiceNowClient:
             raise ValueError("sys_id must be 32 lower-case hex characters.")
         if not isinstance(variables, dict):
             raise ValueError("variables must be a dict.")
+        if requested_for_sys_id is not None:
+            if not isinstance(requested_for_sys_id, str) or not _SYS_ID_RE.fullmatch(requested_for_sys_id):
+                raise ValueError("requested_for_sys_id must be 32 lower-case hex characters.")
 
         url = f"{self.instance}/api/sn_sc/v1/servicecatalog/items/{sys_id}/order_now"
 
@@ -450,11 +577,6 @@ class ServiceNowClient:
             "variables": variables,
         }
 
-        if requested_for_sys_id is not None:
-            if not isinstance(requested_for_sys_id, str) or not _SYS_ID_RE.fullmatch(requested_for_sys_id):
-                raise ValueError("requested_for_sys_id must be 32 lower-case hex characters.")
-            payload["sysparm_requested_for"] = requested_for_sys_id
-
         response = await self._request(
             "POST",
             url,
@@ -462,7 +584,31 @@ class ServiceNowClient:
             json=payload,
         )
 
-        return self._record(response, write=True)
+        record = self._record(response, write=True)
+
+        if requested_for_sys_id is not None:
+            req_sys_id = record.get("sys_id") or record.get("request_id")
+            if not isinstance(req_sys_id, str) or not _SYS_ID_RE.fullmatch(req_sys_id):
+                raise ServiceNowInvalidResponse(
+                    "ServiceNow order_now response returned an invalid sys_id",
+                    possibly_applied=True,
+                )
+
+            ritm_rec = await self.get_ritm_for_request(req_sys_id)
+            ritm_sys_id = ritm_rec.get("sys_id")
+            ritm_number = ritm_rec.get("number")
+
+            await self.update_request_requested_for(
+                req_sys_id=req_sys_id,
+                ritm_sys_id=ritm_sys_id,
+                requested_for_sys_id=requested_for_sys_id,
+            )
+
+            record["ritm_number"] = ritm_number
+            record["ritm_sys_id"] = ritm_sys_id
+            record["requested_for_sys_id"] = requested_for_sys_id
+
+        return record
 
     async def get_incident(
         self,

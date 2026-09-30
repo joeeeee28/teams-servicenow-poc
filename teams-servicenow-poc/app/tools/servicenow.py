@@ -331,6 +331,7 @@ class SearchCatalogToolRequest:
 _SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # A ServiceNow request number; anything else (e.g. a sys_id) is never shown.
 _REQUEST_NUMBER_RE = re.compile(r"^REQ[0-9]{7,10}$")
+_RITM_NUMBER_RE = re.compile(r"^RITM[0-9]{7,10}$")
 _VARIABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 
 
@@ -408,7 +409,9 @@ class ToolResult:
     catalog: Optional[CatalogSearchResult] = None
     """DEMO-05: display-safe catalog search result (SEARCH_CATALOG only)."""
     request_number: Optional[str] = None
-    """DEMO-06: ServiceNow request/RITM number (CREATE_REQUEST only)."""
+    """DEMO-06: ServiceNow request number (CREATE_REQUEST only)."""
+    ritm_number: Optional[str] = None
+    """ServiceNow RITM number (CREATE_REQUEST only)."""
 
     @classmethod
     def ok(
@@ -419,6 +422,7 @@ class ToolResult:
         incident: Optional[dict[str, Any]] = None,
         catalog: Optional[CatalogSearchResult] = None,
         request_number: Optional[str] = None,
+        ritm_number: Optional[str] = None,
     ) -> ToolResult:
         """Construct a successful ToolResult."""
         return cls(
@@ -430,6 +434,7 @@ class ToolResult:
             error_code=None,
             catalog=catalog,
             request_number=request_number,
+            ritm_number=ritm_number,
         )
 
     @classmethod
@@ -855,12 +860,20 @@ class ServiceNowToolGateway:
                 if isinstance(value, str) and _REQUEST_NUMBER_RE.fullmatch(value.strip().upper())
             ), None)
             req_num = req_num.strip().upper() if req_num else None
+
+            ritm_num = next((
+                value for value in (result.get("ritm_number"),)
+                if isinstance(value, str) and _RITM_NUMBER_RE.fullmatch(value.strip().upper())
+            ), None)
+            ritm_num = ritm_num.strip().upper() if ritm_num else None
+
             return ToolResult.ok(
                 action=ServiceNowToolAction.CREATE_REQUEST,
                 safe_message=(f"Request {req_num} created successfully." if req_num
                               else "ServiceNow reported the request as created without a "
                                    "request number."),
                 request_number=req_num,
+                ritm_number=ritm_num,
                 incident=result,
             )
         except ServiceNowError as exc:
