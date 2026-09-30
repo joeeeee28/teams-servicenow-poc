@@ -61,11 +61,11 @@ EMPLOYEE = UserIdentity(
 )
 
 
-def _context(text, user=USER, tenant=TENANT, conversation=CONV):
+def _context(text, user=USER, tenant=TENANT, conversation=CONV, email="demo@example.com"):
     activity = SimpleNamespace(
         id="1712345678901",
         text=text,
-        from_=SimpleNamespace(aad_object_id=user, id=user, name="Demo User"),
+        from_=SimpleNamespace(aad_object_id=user, id=user, name="Demo User", email=email),
         channel_data={"tenant": {"id": tenant}} if tenant else {},
         conversation=SimpleNamespace(id=conversation),
     )
@@ -162,6 +162,7 @@ class TestRequestGatewayExecution(unittest.IsolatedAsyncioTestCase):
             mock_client.create_service_request.assert_awaited_once_with(
                 sys_id="a1b2c3d4e5f60718293a4b5c6d7e8f90",
                 variables={"business_justification": "Design diagrams"},
+                requested_for_sys_id=None,
             )
 
     async def test_gateway_action_mismatch_denied(self):
@@ -197,6 +198,7 @@ class TestRequestHandlerIntegration(unittest.IsolatedAsyncioTestCase):
         self.audit_mock.record = lambda *args, **kwargs: self.audit_events.append((args, kwargs))
 
         self.gateway_client = AsyncMock()
+        self.gateway_client.get_user_by_email_or_upn.return_value = "02826bf03710200044e0bfc8bcbe5d3f"
         self.gateway_client.create_service_request.return_value = {
             "number": "REQ0010099",
             "sys_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
@@ -311,6 +313,7 @@ class _HandlerHarness(unittest.IsolatedAsyncioTestCase):
         self.audit_mock = MagicMock()
         self.audit_mock.record = lambda *a, **k: self.audit_events.append((a, k))
         self.client = AsyncMock()
+        self.client.get_user_by_email_or_upn.return_value = "02826bf03710200044e0bfc8bcbe5d3f"
         result = self.create_result
         if isinstance(result, BaseException):
             self.client.create_service_request.side_effect = result
@@ -407,7 +410,8 @@ class TestRequestSqlitePersistence(_HandlerHarness):
         self.client.create_service_request.assert_awaited_once_with(
             sys_id=ACROBAT_SYS_ID,
             variables={"business_justification": "For drawing architecture charts",
-                       "department": "Engineering", "license_duration": "12 months"})
+                       "department": "Engineering", "license_duration": "12 months"},
+            requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f")
         self.client.create_incident.assert_not_called()
         state = get_session(KEY)
         self.assertIs(state.phase, ConversationPhase.COMPLETED)
@@ -577,7 +581,8 @@ class TestSecondRequestAfterFailureOrCancel(_HandlerHarness):
         self.client.create_service_request.assert_awaited_once_with(
             sys_id=ACROBAT_SYS_ID,
             variables={"business_justification": "Second licence for a contractor",
-                       "department": "Finance", "license_duration": "3 months"})
+                       "department": "Finance", "license_duration": "3 months"},
+            requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f")
 
 
 class TestRequestNotFound(_HandlerHarness):
@@ -683,7 +688,7 @@ class TestCatalogConfiguration(_HandlerHarness):
         replies = [await self._send("I need Microsoft Visio")]  # no questions: confirmation
         replies.append(await self._send("yes"))
         self.client.create_service_request.assert_awaited_once_with(
-            sys_id=CONFIGURED_SYS_ID, variables={})
+            sys_id=CONFIGURED_SYS_ID, variables={}, requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f")
         self.assertIn("REQ0012345", replies[-1])
         for reply in replies:
             self.assertNotIn(CONFIGURED_SYS_ID, reply)
@@ -735,7 +740,7 @@ class TestNoVariableItem(_HandlerHarness):
         reply = await self._send("yes")
         self.assertIn("REQ0012345", reply)
         self.client.create_service_request.assert_awaited_once_with(
-            sys_id=VISIO_SYS_ID, variables={})
+            sys_id=VISIO_SYS_ID, variables={}, requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f")
         self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
         # A repeated confirmation cannot create a second request.
         await self._send("yes")
@@ -755,7 +760,7 @@ class TestNoVariableItem(_HandlerHarness):
         self.assertEqual(get_session(KEY).collected_details["variables"], {})
         self.assertIn("REQ0012345", await self._send("yes"))
         self.client.create_service_request.assert_awaited_once_with(
-            sys_id=VISIO_SYS_ID, variables={})
+            sys_id=VISIO_SYS_ID, variables={}, requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f")
 
 
 class TestRequestUncertainOutcome(_HandlerHarness):
@@ -814,6 +819,108 @@ class TestRequestUncertainOutcome(_HandlerHarness):
             "ServiceNow didn't respond in time. I couldn't confirm whether incident INC0010002 "
             "was updated. Please check its status before trying again. I won't retry "
             "automatically.")
+
+
+class TestPhase1RequestedForResolution(_HandlerHarness):
+    """Phase 1: Teams-user → ServiceNow requested_for resolution tests."""
+
+    async def test_get_user_by_email_or_upn_success(self):
+        from app.servicenow import ServiceNowClient
+        client = ServiceNowClient()
+        mock_resp = {"result": [{"sys_id": "02826bf03710200044e0bfc8bcbe5d3f"}]}
+        mock_req = AsyncMock(return_value=mock_resp)
+        with patch.object(client, "_request", mock_req):
+            sys_id = await client.get_user_by_email_or_upn("test.user@example.com")
+            self.assertEqual(sys_id, "02826bf03710200044e0bfc8bcbe5d3f")
+            mock_req.assert_awaited_once()
+            params = mock_req.call_args.kwargs["params"]
+            self.assertEqual(
+                params["sysparm_query"],
+                "active=true^email=test.user@example.com^ORactive=true^user_name=test.user@example.com",
+            )
+
+    async def test_get_user_by_email_or_upn_not_found(self):
+        from app.servicenow import ServiceNowClient, ServiceNowUserNotFound
+        client = ServiceNowClient()
+        mock_resp = {"result": []}
+        with patch.object(client, "_request", AsyncMock(return_value=mock_resp)):
+            with self.assertRaises(ServiceNowUserNotFound):
+                await client.get_user_by_email_or_upn("missing@example.com")
+
+    async def test_get_user_by_email_or_upn_ambiguous(self):
+        from app.servicenow import ServiceNowClient, ServiceNowAmbiguousUser
+        client = ServiceNowClient()
+        mock_resp = {"result": [{"sys_id": "02826bf03710200044e0bfc8bcbe5d3f"}, {"sys_id": "12826bf03710200044e0bfc8bcbe5d3f"}]}
+        with patch.object(client, "_request", AsyncMock(return_value=mock_resp)):
+            with self.assertRaises(ServiceNowAmbiguousUser):
+                await client.get_user_by_email_or_upn("duplicate@example.com")
+
+    async def test_get_user_by_email_or_upn_lookup_failed(self):
+        from app.servicenow import ServiceNowClient, ServiceNowError, ServiceNowUserLookupFailed
+        client = ServiceNowClient()
+        with patch.object(client, "_request", AsyncMock(side_effect=ServiceNowError("API error"))):
+            with self.assertRaises(ServiceNowUserLookupFailed):
+                await client.get_user_by_email_or_upn("error@example.com")
+
+    async def test_create_service_request_includes_sysparm_requested_for(self):
+        from app.servicenow import ServiceNowClient
+        client = ServiceNowClient()
+        mock_request = AsyncMock(return_value={"result": {"number": "REQ0010001"}})
+        with patch.object(client, "_request", mock_request):
+            await client.create_service_request(
+                sys_id=ACROBAT_SYS_ID,
+                variables={"business_justification": "Test"},
+                requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f",
+            )
+            mock_request.assert_awaited_once()
+            payload = mock_request.call_args.kwargs["json"]
+            self.assertEqual(payload["sysparm_requested_for"], "02826bf03710200044e0bfc8bcbe5d3f")
+            self.assertEqual(payload["sysparm_quantity"], "1")
+
+    async def test_flow_unresolved_teams_user_no_order_now_post(self):
+        """CRITICAL SAFETY TEST 1: Unresolved Teams user -> NO order_now POST."""
+        await self._send("I need Microsoft Visio")
+        ctx = _context("yes", email=None)
+        await main.on_message(ctx)
+        reply = ctx.send.await_args.args[0]
+        self.assertIn("Could not locate your user account in ServiceNow", reply)
+        self.client.create_service_request.assert_not_called()
+
+    async def test_flow_zero_servicenow_matches_no_order_now_post(self):
+        from app.servicenow import ServiceNowUserNotFound
+        self.client.get_user_by_email_or_upn.side_effect = ServiceNowUserNotFound("not found")
+        await self._send("I need Microsoft Visio")
+        reply = await self._send("yes")
+        self.assertIn("Could not locate your user account in ServiceNow", reply)
+        self.client.create_service_request.assert_not_called()
+
+    async def test_flow_ambiguous_matches_no_order_now_post(self):
+        from app.servicenow import ServiceNowAmbiguousUser
+        self.client.get_user_by_email_or_upn.side_effect = ServiceNowAmbiguousUser("ambiguous")
+        await self._send("I need Microsoft Visio")
+        reply = await self._send("yes")
+        self.assertIn("Multiple accounts matched your email in ServiceNow", reply)
+        self.client.create_service_request.assert_not_called()
+
+    async def test_flow_lookup_timeout_no_order_now_post(self):
+        from app.servicenow import ServiceNowUserLookupFailed
+        self.client.get_user_by_email_or_upn.side_effect = ServiceNowUserLookupFailed("timeout")
+        await self._send("I need Microsoft Visio")
+        reply = await self._send("yes")
+        self.assertIn("User lookup in ServiceNow failed", reply)
+        self.client.create_service_request.assert_not_called()
+
+    async def test_flow_resolved_teams_user_exactly_one_order_now_post(self):
+        """CRITICAL SAFETY TEST 2: Teams user resolved -> requested_for sys_id added -> exactly one order_now call."""
+        self.client.get_user_by_email_or_upn.return_value = "02826bf03710200044e0bfc8bcbe5d3f"
+        await self._send("I need Microsoft Visio")
+        reply = await self._send("yes")
+        self.assertIn("REQ0012345", reply)
+        self.client.create_service_request.assert_awaited_once_with(
+            sys_id=VISIO_SYS_ID,
+            variables={},
+            requested_for_sys_id="02826bf03710200044e0bfc8bcbe5d3f",
+        )
 
 
 if __name__ == "__main__":

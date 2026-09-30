@@ -236,8 +236,17 @@ def resolve_identity(activity: Any, channel_tenant_id: str = "") -> UserIdentity
 
     # ── Optional display fields (logging only) ───────────────────────────────
     display_name: Optional[str] = getattr(from_obj, "name", None)
-    # Email is not typically present in Bot Framework activity; left as None.
-    email: Optional[str] = None
+    email: Optional[str] = (
+        getattr(from_obj, "email", None)
+        or getattr(from_obj, "user_principal_name", None)
+        or getattr(from_obj, "upn", None)
+    )
+    if not email and hasattr(from_obj, "properties") and isinstance(from_obj.properties, dict):
+        email = (
+            from_obj.properties.get("email")
+            or from_obj.properties.get("userPrincipalName")
+            or from_obj.properties.get("upn")
+        )
 
     identity = UserIdentity(
         user_id=user_id,

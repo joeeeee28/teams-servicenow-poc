@@ -349,6 +349,7 @@ class CreateRequestToolRequest:
 
     sys_id: str
     variables: dict[str, str]
+    requested_for_sys_id: Optional[str] = None
 
     def validate(self) -> None:
         if not isinstance(self.sys_id, str) or not _SYS_ID_RE.fullmatch(self.sys_id):
@@ -360,6 +361,9 @@ class CreateRequestToolRequest:
                 raise ToolValidationError(f"Invalid variable name: {k!r}")
             if not isinstance(v, str):
                 raise ToolValidationError(f"Variable value for {k!r} must be a string.")
+        if self.requested_for_sys_id is not None:
+            if not isinstance(self.requested_for_sys_id, str) or not _SYS_ID_RE.fullmatch(self.requested_for_sys_id):
+                raise ToolValidationError("Requested for sys_id must be 32 lower-case hex characters.")
 
     def __repr__(self) -> str:
         return f"CreateRequestToolRequest(item_ref=***, variables_count={len(self.variables)})"
@@ -842,6 +846,7 @@ class ServiceNowToolGateway:
             result = await client.create_service_request(
                 sys_id=request.sys_id,
                 variables=request.variables,
+                requested_for_sys_id=request.requested_for_sys_id,
             )
             # Only a real REQ number is ever reported; a missing or malformed
             # number is reported as missing — never invented, never a sys_id.

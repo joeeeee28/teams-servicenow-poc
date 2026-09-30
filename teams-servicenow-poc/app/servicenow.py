@@ -84,6 +84,18 @@ class ServiceNowInvalidResponse(ServiceNowError):
     category = ServiceNowErrorCategory.INVALID_RESPONSE
 
 
+class ServiceNowUserNotFound(ServiceNowError):
+    category = ServiceNowErrorCategory.NOT_FOUND
+
+
+class ServiceNowAmbiguousUser(ServiceNowError):
+    category = ServiceNowErrorCategory.REJECTED
+
+
+class ServiceNowUserLookupFailed(ServiceNowError):
+    category = ServiceNowErrorCategory.SERVER_ERROR
+
+
 _ERROR_CLASSES: dict[ServiceNowErrorCategory, type[ServiceNowError]] = {
     cls.category: cls
     for cls in (ServiceNowNotFound, ServiceNowUnavailable, ServiceNowTimeout,
@@ -369,10 +381,59 @@ class ServiceNowClient:
 
         return self._record(response, write=True)
 
+    async def get_user_by_email_or_upn(
+        self,
+        email_or_upn: str,
+    ) -> str:
+        """
+        Query sys_user table for an active user matching exact email or user_name (UPN).
+        Returns the 32-character hex sys_id of the matching user.
+        Raises ServiceNowUserNotFound, ServiceNowAmbiguousUser, or ServiceNowUserLookupFailed.
+        """
+        if not isinstance(email_or_upn, str) or not email_or_upn.strip():
+            raise ServiceNowUserNotFound("No valid email or UPN provided")
+
+        target = email_or_upn.strip()
+        url = f"{self.instance}/api/now/table/sys_user"
+        params = {
+            "sysparm_query": f"active=true^email={target}^ORactive=true^user_name={target}",
+            "sysparm_fields": "sys_id,user_name,email,active",
+            "sysparm_limit": "2",
+        }
+
+        try:
+            response = await self._request("GET", url, params=params)
+        except ServiceNowError as exc:
+            raise ServiceNowUserLookupFailed(
+                f"ServiceNow user lookup failed: {exc}",
+                status_code=getattr(exc, "status_code", None),
+            ) from None
+
+        results = response.get("result", [])
+        if not isinstance(results, list):
+            raise ServiceNowUserLookupFailed("ServiceNow user lookup result was not a list")
+
+        if len(results) == 0:
+            raise ServiceNowUserNotFound(f"User {target} not found in ServiceNow")
+
+        if len(results) > 1:
+            raise ServiceNowAmbiguousUser(f"Multiple active users found in ServiceNow for {target}")
+
+        user_rec = results[0]
+        if not isinstance(user_rec, dict):
+            raise ServiceNowUserLookupFailed("ServiceNow user record was not an object")
+
+        sys_id = user_rec.get("sys_id")
+        if not isinstance(sys_id, str) or not _SYS_ID_RE.fullmatch(sys_id):
+            raise ServiceNowUserLookupFailed("ServiceNow user record returned an invalid sys_id")
+
+        return sys_id
+
     async def create_service_request(
         self,
         sys_id: str,
         variables: dict[str, str],
+        requested_for_sys_id: str | None = None,
     ) -> dict:
         """
         Create a ServiceNow service catalog request.
@@ -384,10 +445,15 @@ class ServiceNowClient:
 
         url = f"{self.instance}/api/sn_sc/v1/servicecatalog/items/{sys_id}/order_now"
 
-        payload = {
+        payload: dict[str, Any] = {
             "sysparm_quantity": "1",
             "variables": variables,
         }
+
+        if requested_for_sys_id is not None:
+            if not isinstance(requested_for_sys_id, str) or not _SYS_ID_RE.fullmatch(requested_for_sys_id):
+                raise ValueError("requested_for_sys_id must be 32 lower-case hex characters.")
+            payload["sysparm_requested_for"] = requested_for_sys_id
 
         response = await self._request(
             "POST",

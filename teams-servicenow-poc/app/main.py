@@ -25,9 +25,12 @@ from app.models import (
     UpdateIncidentRequest,
 )
 from app.servicenow import (
+    ServiceNowAmbiguousUser,
     ServiceNowClient,
     ServiceNowError,
     ServiceNowNotFound,
+    ServiceNowUserLookupFailed,
+    ServiceNowUserNotFound,
     catalog_sys_ids_from_env,
 )
 from app.confirmation import ConfirmationDecision, evaluate_confirmation
@@ -1245,7 +1248,70 @@ async def _create_confirmed_request(context, user_id: str, session) -> None:
         correlation_id=correlation_id, action=AuthorizableAction.CREATE_REQUEST,
     )
 
-    tool_request = CreateRequestToolRequest(sys_id=sys_id, variables=variables)
+    # ── Resolve Teams user to ServiceNow sys_user sys_id ────────────────────
+    user_email_or_upn = identity.email
+    if not user_email_or_upn:
+        logger.warning("request creation blocked: unresolved requester identity for user=%r", user_id)
+        _audit_session(
+            AuditEventType.REQUEST_CREATE_FAILED, context, session,
+            action=AuthorizableAction.CREATE_REQUEST, reason="requester_not_found",
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(_state_key(context.activity), session)
+        await context.send(
+            "⚠️ Could not locate your user account in ServiceNow. Please contact IT support."
+        )
+        return
+
+    sn_client = servicenow_gateway._get_client()
+    try:
+        requested_for_sys_id = await sn_client.get_user_by_email_or_upn(user_email_or_upn)
+    except ServiceNowUserNotFound:
+        logger.warning("request creation blocked: requester %r not found in ServiceNow", user_email_or_upn)
+        _audit_session(
+            AuditEventType.REQUEST_CREATE_FAILED, context, session,
+            action=AuthorizableAction.CREATE_REQUEST, reason="requester_not_found",
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(_state_key(context.activity), session)
+        await context.send(
+            "⚠️ Could not locate your user account in ServiceNow. Please contact IT support."
+        )
+        return
+    except ServiceNowAmbiguousUser:
+        logger.warning("request creation blocked: ambiguous requester %r in ServiceNow", user_email_or_upn)
+        _audit_session(
+            AuditEventType.REQUEST_CREATE_FAILED, context, session,
+            action=AuthorizableAction.CREATE_REQUEST, reason="ambiguous_requester_match",
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(_state_key(context.activity), session)
+        await context.send(
+            "⚠️ Multiple accounts matched your email in ServiceNow. Please contact IT support."
+        )
+        return
+    except ServiceNowUserLookupFailed:
+        logger.warning("request creation blocked: user lookup failed for %r", user_email_or_upn)
+        _audit_session(
+            AuditEventType.REQUEST_CREATE_FAILED, context, session,
+            action=AuthorizableAction.CREATE_REQUEST, reason="requester_lookup_failed",
+        )
+        session.transition_to(ConversationPhase.CANCELLED)
+        session.transition_to(ConversationPhase.IDLE)
+        save_session(_state_key(context.activity), session)
+        await context.send(
+            "⚠️ User lookup in ServiceNow failed. Please try again later."
+        )
+        return
+
+    tool_request = CreateRequestToolRequest(
+        sys_id=sys_id,
+        variables=variables,
+        requested_for_sys_id=requested_for_sys_id,
+    )
 
     session.transition_to(ConversationPhase.EXECUTING)
     save_session(_state_key(context.activity), session)
