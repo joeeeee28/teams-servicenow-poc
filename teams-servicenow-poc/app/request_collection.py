@@ -90,18 +90,24 @@ def start_request_collection(
 ) -> RequestCollectionResult:
     """
     Initialize request collection for an approved catalog item.
+
+    A conversation left in a terminal phase (COMPLETED / FAILED / CANCELLED)
+    is first returned to IDLE via its normal transition (same as
+    ``start_incident_collection``).
     """
-    if session.phase not in (
-        ConversationPhase.IDLE,
+    if session.phase in (
         ConversationPhase.COMPLETED,
         ConversationPhase.FAILED,
         ConversationPhase.CANCELLED,
     ):
+        session.transition_to(ConversationPhase.IDLE)
+
+    if session.phase is not ConversationPhase.IDLE:
         raise RequestCollectionError(f"Cannot start request collection from phase {session.phase.value!r}")
 
     session.transition_to(ConversationPhase.COLLECTING)
     session.pending_action = CREATE_REQUEST_ACTION
-    
+
     # Details stored in session
     session.collected_details = {
         "item_ref": item.item_ref,

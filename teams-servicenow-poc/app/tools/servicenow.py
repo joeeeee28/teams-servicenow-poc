@@ -324,6 +324,8 @@ class SearchCatalogToolRequest:
 
 
 _SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# A ServiceNow request number; anything else (e.g. a sys_id) is never shown.
+_REQUEST_NUMBER_RE = re.compile(r"^REQ[0-9]{7,10}$")
 _VARIABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 
 
@@ -836,10 +838,18 @@ class ServiceNowToolGateway:
                 sys_id=request.sys_id,
                 variables=request.variables,
             )
-            req_num = result.get("number") or result.get("request_number") or result.get("sys_id", "REQ0010001")
+            # Only a real REQ number is ever reported; a missing or malformed
+            # number is reported as missing — never invented, never a sys_id.
+            req_num = next((
+                value for value in (result.get("number"), result.get("request_number"))
+                if isinstance(value, str) and _REQUEST_NUMBER_RE.fullmatch(value.strip().upper())
+            ), None)
+            req_num = req_num.strip().upper() if req_num else None
             return ToolResult.ok(
                 action=ServiceNowToolAction.CREATE_REQUEST,
-                safe_message=f"Request {req_num} created successfully.",
+                safe_message=(f"Request {req_num} created successfully." if req_num
+                              else "ServiceNow reported the request as created without a "
+                                   "request number."),
                 request_number=req_num,
                 incident=result,
             )

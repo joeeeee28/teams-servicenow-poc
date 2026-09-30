@@ -21,7 +21,8 @@ WHAT IS PERSISTED (allowlist)
 ─────────────────────────────
 phase, pending_action, intent (known intents only), collected incident fields
 (create: short_description / description / impact / urgency; update:
-changes / requested / current for the same fields) — only while the operation
+changes / requested / current for the same fields; DEMO-06 request:
+item_ref / sys_id / item_name / variables, each validated) — only while the operation
 is in progress, never for COMPLETED / FAILED — incident_number
 (``INC`` + digits only), correlation_id (plain identifier only), last_error
 (the gateway's fixed safe message), created_at and updated_at.
@@ -61,6 +62,7 @@ from typing import Any, Mapping, Optional
 
 from app.incident_collection import CREATE_INCIDENT_ACTION, INCIDENT_FIELDS
 from app.incident_update import UPDATE_FIELDS, UPDATE_INCIDENT_ACTION
+from app.request_collection import CREATE_REQUEST_ACTION
 from app.state import (
     ConversationPhase,
     ConversationState,
@@ -77,7 +79,8 @@ SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "conversation_state.db"
 MAX_STATE_BYTES = 64 * 1024
 
-_PENDING_ACTIONS = frozenset({CREATE_INCIDENT_ACTION, UPDATE_INCIDENT_ACTION})
+_PENDING_ACTIONS = frozenset({CREATE_INCIDENT_ACTION, UPDATE_INCIDENT_ACTION,
+                              CREATE_REQUEST_ACTION})
 _INTENTS = frozenset({
     "diagnose", "find_solution", "create_incident", "incident_status",
     "service_request", "human_escalation", "general", UPDATE_INCIDENT_ACTION,
@@ -85,6 +88,13 @@ _INTENTS = frozenset({
 _INCIDENT_FIELDS = frozenset(INCIDENT_FIELDS)
 _UPDATE_FIELDS = frozenset(UPDATE_FIELDS)
 _INCIDENT_NUMBER_RE = re.compile(r"^INC[0-9]{7,10}$")
+# DEMO-06 request collection (validated exactly as the catalog models do).
+_ITEM_REF_RE = re.compile(r"^CAT[0-9]{4}$")
+_SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_VARIABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+_MAX_ITEM_NAME = 80
+_MAX_VARIABLES = 8
+_MAX_VARIABLE_VALUE = 500
 _CORRELATION_RE = re.compile(r"^[A-Za-z0-9:_\-.|]{1,128}$")
 _MAX_LAST_ERROR = 500
 _PHASES_WITH_ACTION = frozenset({
@@ -122,7 +132,10 @@ class StateDecodeError(ValueError):
 # ===========================================================================
 
 def _clean_details(details: Any) -> dict[str, Any]:
-    """Only the incident fields the create/update workflows use, as strings."""
+    """
+    Only the fields the create/update incident and (DEMO-06) create-request
+    workflows use, each validated; anything else is dropped.
+    """
     if not isinstance(details, Mapping):
         return {}
     clean: dict[str, Any] = {}
@@ -134,6 +147,19 @@ def _clean_details(details: Any) -> dict[str, Any]:
                           if f in _UPDATE_FIELDS and isinstance(v, str)}
         elif key == "requested" and isinstance(value, (list, tuple)):
             clean[key] = [f for f in value if f in _UPDATE_FIELDS]
+        # DEMO-06: service request collection.
+        elif key == "item_ref" and isinstance(value, str) and _ITEM_REF_RE.fullmatch(value):
+            clean[key] = value
+        elif key == "sys_id" and isinstance(value, str) and _SYS_ID_RE.fullmatch(value):
+            clean[key] = value
+        elif key == "item_name" and isinstance(value, str) and 0 < len(value) <= _MAX_ITEM_NAME:
+            clean[key] = value
+        elif key == "variables" and isinstance(value, Mapping):
+            clean[key] = dict(list(
+                (k, v) for k, v in value.items()
+                if isinstance(k, str) and _VARIABLE_NAME_RE.fullmatch(k)
+                and isinstance(v, str) and len(v) <= _MAX_VARIABLE_VALUE
+            )[:_MAX_VARIABLES])
     return clean
 
 

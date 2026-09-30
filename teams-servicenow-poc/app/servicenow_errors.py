@@ -155,6 +155,16 @@ _UNCONFIRMED_UPDATE = (
     "{reason} I couldn't confirm whether incident {n} was updated. Please check its "
     "status before trying again. I won't retry automatically."
 )
+_UNCONFIRMED_CREATE_REQUEST = (
+    "{reason} I couldn't confirm whether your service request was created — it may or "
+    "may not exist. Please check your requests in ServiceNow before trying again. "
+    "I won't retry automatically."
+)
+_UNCONFIRMED = {
+    "create": _UNCONFIRMED_CREATE,
+    "update": _UNCONFIRMED_UPDATE,
+    "create_request": _UNCONFIRMED_CREATE_REQUEST,   # DEMO-06
+}
 
 
 def failure_message(
@@ -165,8 +175,9 @@ def failure_message(
     incident_number: Optional[str] = None,
 ) -> str:
     """
-    Fixed user-facing message.  *operation* is ``"read"``, ``"create"`` or
-    ``"update"``; *incident_number* must already be validated.
+    Fixed user-facing message.  *operation* is ``"read"``, ``"create"``,
+    ``"update"`` or ``"create_request"`` (DEMO-06); *incident_number* must
+    already be validated.
     """
     n = incident_number or "the incident"
     if category is ServiceNowErrorCategory.NOT_FOUND and not incident_number:
@@ -177,6 +188,5 @@ def failure_message(
         return _READ[category].format(n=n)
     if possibly_applied:
         reason = _UNCONFIRMED_REASON.get(category, "ServiceNow didn't confirm the result.")
-        template = _UNCONFIRMED_CREATE if operation == "create" else _UNCONFIRMED_UPDATE
-        return template.format(reason=reason, n=n)
+        return _UNCONFIRMED[operation].format(reason=reason, n=n)
     return _NOT_APPLIED[category].format(n=n)

@@ -1259,7 +1259,7 @@ async def _create_confirmed_request(context, user_id: str, session) -> None:
         )
 
     if tool_result.success:
-        req_num = tool_result.request_number or "REQ0010001"
+        req_num = tool_result.request_number  # validated REQ number, or None
         session.transition_to(ConversationPhase.COMPLETED)
         _audit(
             AuditEventType.REQUEST_CREATE_COMPLETED, context,
@@ -1269,10 +1269,20 @@ async def _create_confirmed_request(context, user_id: str, session) -> None:
         )
         save_session(_state_key(context.activity), session)
 
-        await context.send(
-            f"✅ Request **{req_num}** has been created successfully for **{item_name}**.\n\n"
-            "Thank you!"
-        )
+        if req_num:
+            await context.send(
+                f"✅ Request **{req_num}** has been created successfully for **{item_name}**.\n\n"
+                "Thank you!"
+            )
+        else:
+            # Same honest pattern as incident creation (BL-007): never invent
+            # a number, never show a sys_id, never invite a duplicate.
+            await context.send(
+                f"✅ ServiceNow reported the request for **{item_name}** as created but "
+                "did not return a request number.\n\n"
+                "Please do not submit it again — contact IT support to confirm the "
+                "request number."
+            )
         return
 
     session.last_error = tool_result.safe_message
@@ -1286,7 +1296,8 @@ async def _create_confirmed_request(context, user_id: str, session) -> None:
     )
     save_session(_state_key(context.activity), session)
 
-    await context.send(f"❌ {tool_result.safe_message}")
+    # DEMO-02 pattern: ⚠️ + "couldn't confirm" when the write may have applied.
+    await context.send(_write_failure_reply(tool_result, f"❌ {tool_result.safe_message}"))
 
 
 # ============================================================

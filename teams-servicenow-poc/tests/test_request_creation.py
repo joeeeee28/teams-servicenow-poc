@@ -271,5 +271,267 @@ class TestRequestHandlerIntegration(unittest.IsolatedAsyncioTestCase):
         self.gateway_client.create_service_request.assert_not_called()
 
 
+# ===========================================================================
+# Regression: SQLite persistence, request numbers, uncertain outcomes
+# ===========================================================================
+
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from app.servicenow import ServiceNowTimeout  # noqa: E402
+from app.servicenow_errors import ServiceNowErrorCategory, failure_message  # noqa: E402
+from app.state_store import SqliteStateRepository, serialize_state  # noqa: E402
+
+VISIO_SYS_ID = "c0a8010e5d5f4c1b9e2f00000000c001"
+RETURNED_SYS_ID = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+VISIO_TURNS = ("For drawing architecture charts", "Engineering", "12 months")
+
+
+class _HandlerHarness(unittest.IsolatedAsyncioTestCase):
+    """Real handler + real gateway; only the ServiceNow client and LLM are mocked."""
+
+    create_result: object = {"number": "REQ0012345", "sys_id": RETURNED_SYS_ID}
+
+    async def asyncSetUp(self):
+        previous_store = get_state_repository()
+        self.addCleanup(configure_state_repository, previous_store)
+        configure_state_repository(InMemoryStateRepository())
+        self.audit_events = []
+        self.audit_mock = MagicMock()
+        self.audit_mock.record = lambda *a, **k: self.audit_events.append((a, k))
+        self.client = AsyncMock()
+        result = self.create_result
+        if isinstance(result, BaseException):
+            self.client.create_service_request.side_effect = result
+        else:
+            self.client.create_service_request.return_value = result
+        self.client.create_incident.side_effect = AssertionError("incident created")
+        self.client.update_incident.side_effect = AssertionError("incident updated")
+        self.gateway = ServiceNowToolGateway(client=self.client, audit_logger=self.audit_mock)
+        self.classify = AsyncMock(side_effect=lambda msg: {"intent": "service_request",
+                                                           "summary": "x"})
+        for p in (
+            patch.object(main, "servicenow_gateway", self.gateway),
+            patch.object(main, "classify_message", self.classify),
+            patch.object(main, "audit_logger", self.audit_mock),
+            patch.dict(os.environ, {"TEAMS_TENANT_ID": TENANT}),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    async def _send(self, text):
+        ctx = _context(text)
+        await main.on_message(ctx)
+        return ctx.send.await_args.args[0]
+
+    async def _ready(self):
+        await self._send("I need Microsoft Visio")
+        for answer in VISIO_TURNS:
+            reply = await self._send(answer)
+        self.assertIs(get_session(KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        return reply
+
+    def _audited(self, event_type):
+        return [k for a, k in self.audit_events if a and a[0] is event_type]
+
+
+class TestRequestSqlitePersistence(_HandlerHarness):
+    """The default SQLite store must carry a request across Teams messages."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "conversation_state.db"
+        self._open()
+
+    def _open(self):
+        self.repo = SqliteStateRepository(self.path)
+        self.addCleanup(self.repo.close)
+        configure_state_repository(self.repo)
+
+    def _restart(self):
+        """Simulate the next Teams turn arriving at a fresh process."""
+        self.repo.close()
+        self._open()
+
+    def _stored(self):
+        row = sqlite3.connect(self.path).execute(
+            "SELECT state_json FROM conversation_state").fetchone()
+        return json.loads(row[0])
+
+    async def test_request_flow_survives_every_turn_and_executes_once(self):
+        # 1. Start the request.
+        reply = await self._send("I need Microsoft Visio")
+        self.assertIn("Business justification", reply)
+        # 2. Persisted.
+        stored = self._stored()
+        self.assertEqual(stored["pending_action"], "create_request")
+        self.assertEqual(stored["collected_details"], {
+            "item_ref": "CAT0001", "sys_id": VISIO_SYS_ID,
+            "item_name": "Microsoft Visio", "variables": {}})
+        # 3–4. Each next turn arrives at a fresh repository and continues.
+        prompts = ("Department", "License duration", "Request Confirmation")
+        for answer, expected in zip(VISIO_TURNS, prompts):
+            self._restart()
+            reply = await self._send(answer)
+            self.assertIn(expected, reply)
+            state = get_session(KEY)
+            self.assertEqual(state.pending_action, "create_request")
+            self.assertEqual(state.collected_details["item_ref"], "CAT0001")
+        # 5. Confirmation reached, with every value intact.
+        self.assertIs(get_session(KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(get_session(KEY).collected_details["variables"], {
+            "business_justification": "For drawing architecture charts",
+            "department": "Engineering", "license_duration": "12 months"})
+        for text in VISIO_TURNS:
+            self.assertIn(text, reply)
+        # 6. Executed exactly once, never as an incident.
+        self._restart()
+        reply = await self._send("yes")
+        self.assertIn("REQ0012345", reply)
+        self.classify.assert_awaited_once()  # collection/confirmation turns never reach the LLM
+        self._restart()
+        await self._send("yes")  # a new message after completion: must not re-execute
+        self.client.create_service_request.assert_awaited_once_with(
+            sys_id=VISIO_SYS_ID,
+            variables={"business_justification": "For drawing architecture charts",
+                       "department": "Engineering", "license_duration": "12 months"})
+        self.client.create_incident.assert_not_called()
+        state = get_session(KEY)
+        self.assertIs(state.phase, ConversationPhase.COMPLETED)
+        self.assertEqual(state.collected_details, {})  # DEMO-01: not kept at rest
+
+    async def test_ready_request_survives_restart(self):
+        await self._ready()
+        self._restart()
+        state = get_session(KEY)
+        self.assertIs(state.phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(state.pending_action, "create_request")
+
+    def test_invalid_request_details_are_not_persisted(self):
+        state = ConversationState(
+            phase=ConversationPhase.COLLECTING, pending_action="create_request",
+            collected_details={
+                "item_ref": "CAT1; DROP", "sys_id": "../../sys_user", "item_name": "x" * 81,
+                "variables": {"Bad Name": "v", "ok_name": "y" * 501, "department": "Eng",
+                              "count": 3},
+                "password": "hunter2",
+            })
+        details = serialize_state(state)["collected_details"]
+        self.assertEqual(details, {"variables": {"department": "Eng"}})
+
+
+class TestRequestNumbers(_HandlerHarness):
+
+    async def _confirm(self, result):
+        self.client.create_service_request.return_value = result
+        await self._ready()
+        return await self._send("yes")
+
+    async def test_real_request_number_reported(self):
+        reply = await self._confirm({"number": "REQ0012345", "sys_id": RETURNED_SYS_ID})
+        self.assertIn("✅ Request **REQ0012345** has been created successfully", reply)
+
+    async def test_sys_id_only_is_never_displayed(self):
+        reply = await self._confirm({"sys_id": RETURNED_SYS_ID})
+        self.assertNotIn(RETURNED_SYS_ID, reply)
+        self.assertNotIn(VISIO_SYS_ID, reply)
+        self.assertIn("did not return a request number", reply)
+        self.assertIn("do not submit it again", reply)
+
+    async def test_no_number_is_never_fabricated(self):
+        for result in ({}, {"number": ""}, {"number": "abc"}, {"request_number": 42},
+                       {"number": RETURNED_SYS_ID}):
+            with self.subTest(result=result):
+                configure_state_repository(InMemoryStateRepository())  # fresh conversation
+                reply = await self._confirm(result)
+                self.assertNotIn("REQ0010001", reply)
+                self.assertNotIn("Request **", reply)
+                self.assertNotIn(RETURNED_SYS_ID, reply)
+                self.assertIn("did not return a request number", reply)
+                self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
+
+    async def test_gateway_never_reports_sys_id_as_number(self):
+        authz = authorize(EMPLOYEE, AuthorizableAction.CREATE_REQUEST)
+        self.client.create_service_request.return_value = {"sys_id": RETURNED_SYS_ID}
+        result = await self.gateway.execute(
+            EMPLOYEE, authz, ServiceNowToolAction.CREATE_REQUEST,
+            CreateRequestToolRequest(sys_id=VISIO_SYS_ID, variables={}))
+        self.assertTrue(result.success)
+        self.assertIsNone(result.request_number)
+        self.assertNotIn(RETURNED_SYS_ID, result.safe_message)
+        self.assertNotIn("REQ0010001", result.safe_message)
+
+
+class TestSecondRequest(_HandlerHarness):
+
+    async def test_second_request_after_completion_starts_and_completes(self):
+        # Request #1 → confirmation → COMPLETED.
+        await self._ready()
+        self.assertIn("REQ0012345", await self._send("yes"))
+        self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
+
+        # Request #2 in the same conversation starts a fresh collection.
+        self.client.create_service_request.return_value = {"number": "REQ0012346"}
+        reply = await self._send("I need Microsoft Visio")
+        self.assertNotIn("having trouble understanding", reply)
+        self.assertIn("Business justification", reply)
+        state = get_session(KEY)
+        self.assertIs(state.phase, ConversationPhase.COLLECTING)
+        self.assertEqual(state.pending_action, "create_request")
+        self.assertEqual(state.collected_details["variables"], {})  # nothing carried over
+
+        for answer in ("Second licence for a contractor", "Finance", "3 months"):
+            reply = await self._send(answer)
+        self.assertIn("Second licence for a contractor", reply)
+        self.assertNotIn("For drawing architecture charts", reply)
+        self.assertIn("REQ0012346", await self._send("yes"))
+
+        # Exactly two creates: request #1 was never re-submitted.
+        calls = self.client.create_service_request.await_args_list
+        self.assertEqual([c.kwargs["variables"]["business_justification"] for c in calls],
+                         ["For drawing architecture charts", "Second licence for a contractor"])
+        self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
+
+
+class TestRequestUncertainOutcome(_HandlerHarness):
+
+    create_result = ServiceNowTimeout("timed out", possibly_applied=True)
+
+    async def test_create_request_timeout_is_reported_as_unconfirmed(self):
+        await self._ready()
+        reply = await self._send("yes")
+        self.assertTrue(reply.startswith("⚠️"))
+        self.assertIn("didn't respond in time", reply)
+        self.assertIn("couldn't confirm whether your service request was created", reply)
+        self.assertIn("may or may not exist", reply)
+        self.assertIn("check your requests in ServiceNow before trying again", reply)
+        self.assertIn("won't retry automatically", reply)
+        for wrong in ("incident", "the incident", "No change was made", "✅"):
+            self.assertNotIn(wrong, reply)
+        self.assertIs(get_session(KEY).phase, ConversationPhase.FAILED)
+        await self._send("yes")  # a second "yes" must not retry the write
+        self.client.create_service_request.assert_awaited_once()
+        failed = self._audited(AuditEventType.REQUEST_CREATE_FAILED)
+        self.assertEqual([k["reason"] for k in failed], ["servicenow_timeout_unconfirmed"])
+
+    def test_incident_messages_unchanged(self):
+        self.assertEqual(
+            failure_message(ServiceNowErrorCategory.TIMEOUT, operation="create",
+                            possibly_applied=True),
+            "ServiceNow didn't respond in time. I couldn't confirm whether the incident was "
+            "created. Please check your incidents in ServiceNow before trying again. I won't "
+            "retry automatically.")
+        self.assertEqual(
+            failure_message(ServiceNowErrorCategory.TIMEOUT, operation="update",
+                            possibly_applied=True, incident_number="INC0010002"),
+            "ServiceNow didn't respond in time. I couldn't confirm whether incident INC0010002 "
+            "was updated. Please check its status before trying again. I won't retry "
+            "automatically.")
+
+
 if __name__ == "__main__":
     unittest.main()
