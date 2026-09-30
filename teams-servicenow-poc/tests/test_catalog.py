@@ -307,13 +307,20 @@ class TestUntrustedContent(unittest.IsolatedAsyncioTestCase):
 class TestReplies(unittest.IsolatedAsyncioTestCase):
 
     async def test_found_shows_name_purpose_and_required_info(self):
-        answer = format_catalog_answer(await _search(FIXTURE_SERVICE, "I need Microsoft Visio."))
-        self.assertIn("**Microsoft Visio** (CAT0001) · Software", answer)
-        self.assertIn("Diagramming software", answer)
+        answer = format_catalog_answer(await _search(FIXTURE_SERVICE, "I need Adobe Acrobat Pro."))
+        self.assertIn("**Adobe Acrobat Pro** (CAT0002) · Software", answer)
+        self.assertIn("Create, edit and sign PDF", answer)
         for label in ("- Business justification", "- Department",
                       "- License duration (3 months, 6 months or 12 months)"):
             self.assertIn(label, answer)
         self.assertIn("no request has been created", answer)
+
+    async def test_found_item_without_variables_needs_no_information(self):
+        answer = format_catalog_answer(await _search(FIXTURE_SERVICE, "I need Microsoft Visio."))
+        self.assertIn("**Microsoft Visio** (CAT0001) · Software", answer)
+        self.assertIn("No additional information is needed to request it.", answer)
+        for label in ("Business justification", "Department", "License duration"):
+            self.assertNotIn(label, answer)
 
     async def test_optional_variables_not_listed_as_required(self):
         answer = format_catalog_answer(await _search(FIXTURE_SERVICE, "additional monitor screen"))
@@ -556,11 +563,11 @@ class _Integration(unittest.IsolatedAsyncioTestCase):
 class TestHandler(_Integration):
 
     async def test_service_request_intent_discovers_item(self):
-        reply = await self._send("Show me Microsoft Visio.")
-        self.assertIn("**Microsoft Visio** (CAT0001)", reply)
+        reply = await self._send("Show me Adobe Acrobat Pro.")
+        self.assertIn("**Adobe Acrobat Pro** (CAT0002)", reply)
         self.assertIn("- Business justification", reply)
         self.assertNotIn(LLM_SUMMARY, reply)
-        self.classify.assert_awaited_once_with("Show me Microsoft Visio.")
+        self.classify.assert_awaited_once_with("Show me Adobe Acrobat Pro.")
 
     async def test_browse_phrase_needs_no_llm(self):
         self.classify.side_effect = AssertionError("LLM called")

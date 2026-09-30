@@ -20,7 +20,9 @@ CATALOG_RECORDS = (
         "name": "Microsoft Visio", "category": "software", "active": True, "approved": True,
         "description": "Diagramming software for flowcharts, network diagrams and org charts.",
         "keywords": "visio diagram diagramming flowchart drawing microsoft software license",
-        "variables": [_JUSTIFICATION, _DEPARTMENT, _DURATION],
+        # The mapped ServiceNow item has no catalog variables (verified live),
+        # so nothing is collected: the request goes straight to confirmation.
+        "variables": [],
     },
     {
         "item_ref": "CAT0002", "sys_id": "c0a8010e5d5f4c1b9e2f00000000c002",

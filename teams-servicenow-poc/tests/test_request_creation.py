@@ -76,11 +76,11 @@ class TestRequestCollectionUnit(unittest.TestCase):
 
     def setUp(self):
         self.catalog = LocalCatalogRepository.from_fixture()
-        self.visio_item = self.catalog.get_item_by_ref("CAT0001")
+        self.item = self.catalog.get_item_by_ref("CAT0002")  # Adobe Acrobat Pro: has variables
 
     def test_start_collection_prompts_for_variable(self):
         session = ConversationState()
-        res = start_request_collection(session, self.visio_item)
+        res = start_request_collection(session, self.item)
         self.assertEqual(session.phase, ConversationPhase.COLLECTING)
         self.assertEqual(session.pending_action, CREATE_REQUEST_ACTION)
         self.assertIn("Business justification", res.reply)
@@ -88,10 +88,10 @@ class TestRequestCollectionUnit(unittest.TestCase):
 
     def test_process_variable_value_moves_to_confirmation(self):
         session = ConversationState()
-        start_request_collection(session, self.visio_item)
-        process_request_collection_message(session, self.visio_item, "Vector architecture diagrams")
-        process_request_collection_message(session, self.visio_item, "Engineering")
-        res = process_request_collection_message(session, self.visio_item, "12 months")
+        start_request_collection(session, self.item)
+        process_request_collection_message(session, self.item, "Vector architecture diagrams")
+        process_request_collection_message(session, self.item, "Engineering")
+        res = process_request_collection_message(session, self.item, "12 months")
         self.assertEqual(session.phase, ConversationPhase.READY_FOR_CONFIRMATION)
         self.assertIn("Request Confirmation", res.reply)
         self.assertIn("Vector architecture diagrams", res.reply)
@@ -101,8 +101,8 @@ class TestRequestCollectionUnit(unittest.TestCase):
 
     def test_cancellation_resets_session(self):
         session = ConversationState()
-        start_request_collection(session, self.visio_item)
-        res = process_request_collection_message(session, self.visio_item, "cancel")
+        start_request_collection(session, self.item)
+        res = process_request_collection_message(session, self.item, "cancel")
         self.assertTrue(res.cancelled)
         self.assertEqual(session.phase, ConversationPhase.IDLE)
 
@@ -218,8 +218,8 @@ class TestRequestHandlerIntegration(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
 
     async def test_full_service_request_flow_end_to_end(self):
-        # Turn 1: "I need Microsoft Visio"
-        ctx1 = _context("I need Microsoft Visio")
+        # Turn 1: "I need Adobe Acrobat Pro"
+        ctx1 = _context("I need Adobe Acrobat Pro")
         await main.on_message(ctx1)
         reply1 = ctx1.send.await_args.args[0]
         self.assertIn("Business justification", reply1)
@@ -255,7 +255,7 @@ class TestRequestHandlerIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_during_confirmation(self):
         # Turns to reach READY_FOR_CONFIRMATION
-        await main.on_message(_context("I need Microsoft Visio"))
+        await main.on_message(_context("I need Adobe Acrobat Pro"))
         await main.on_message(_context("For drawing charts"))
         await main.on_message(_context("Engineering"))
         await main.on_message(_context("12 months"))
@@ -284,9 +284,10 @@ from app.servicenow import ServiceNowTimeout  # noqa: E402
 from app.servicenow_errors import ServiceNowErrorCategory, failure_message  # noqa: E402
 from app.state_store import SqliteStateRepository, serialize_state  # noqa: E402
 
-VISIO_SYS_ID = "c0a8010e5d5f4c1b9e2f00000000c001"
+VISIO_SYS_ID = "c0a8010e5d5f4c1b9e2f00000000c001"      # CAT0001: no variables
+ACROBAT_SYS_ID = "c0a8010e5d5f4c1b9e2f00000000c002"    # CAT0002: 3 variables
 RETURNED_SYS_ID = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
-VISIO_TURNS = ("For drawing architecture charts", "Engineering", "12 months")
+REQUEST_TURNS = ("For drawing architecture charts", "Engineering", "12 months")
 
 
 class _HandlerHarness(unittest.IsolatedAsyncioTestCase):
@@ -335,8 +336,8 @@ class _HandlerHarness(unittest.IsolatedAsyncioTestCase):
         return ctx.send.await_args.args[0]
 
     async def _ready(self):
-        await self._send("I need Microsoft Visio")
-        for answer in VISIO_TURNS:
+        await self._send("I need Adobe Acrobat Pro")
+        for answer in REQUEST_TURNS:
             reply = await self._send(answer)
         self.assertIs(get_session(KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
         return reply
@@ -372,29 +373,29 @@ class TestRequestSqlitePersistence(_HandlerHarness):
 
     async def test_request_flow_survives_every_turn_and_executes_once(self):
         # 1. Start the request.
-        reply = await self._send("I need Microsoft Visio")
+        reply = await self._send("I need Adobe Acrobat Pro")
         self.assertIn("Business justification", reply)
         # 2. Persisted.
         stored = self._stored()
         self.assertEqual(stored["pending_action"], "create_request")
         self.assertEqual(stored["collected_details"], {
-            "item_ref": "CAT0001", "sys_id": VISIO_SYS_ID,
-            "item_name": "Microsoft Visio", "variables": {}})
+            "item_ref": "CAT0002", "sys_id": ACROBAT_SYS_ID,
+            "item_name": "Adobe Acrobat Pro", "variables": {}})
         # 3–4. Each next turn arrives at a fresh repository and continues.
         prompts = ("Department", "License duration", "Request Confirmation")
-        for answer, expected in zip(VISIO_TURNS, prompts):
+        for answer, expected in zip(REQUEST_TURNS, prompts):
             self._restart()
             reply = await self._send(answer)
             self.assertIn(expected, reply)
             state = get_session(KEY)
             self.assertEqual(state.pending_action, "create_request")
-            self.assertEqual(state.collected_details["item_ref"], "CAT0001")
+            self.assertEqual(state.collected_details["item_ref"], "CAT0002")
         # 5. Confirmation reached, with every value intact.
         self.assertIs(get_session(KEY).phase, ConversationPhase.READY_FOR_CONFIRMATION)
         self.assertEqual(get_session(KEY).collected_details["variables"], {
             "business_justification": "For drawing architecture charts",
             "department": "Engineering", "license_duration": "12 months"})
-        for text in VISIO_TURNS:
+        for text in REQUEST_TURNS:
             self.assertIn(text, reply)
         # 6. Executed exactly once, never as an incident.
         self._restart()
@@ -404,7 +405,7 @@ class TestRequestSqlitePersistence(_HandlerHarness):
         self._restart()
         await self._send("yes")  # a new message after completion: must not re-execute
         self.client.create_service_request.assert_awaited_once_with(
-            sys_id=VISIO_SYS_ID,
+            sys_id=ACROBAT_SYS_ID,
             variables={"business_justification": "For drawing architecture charts",
                        "department": "Engineering", "license_duration": "12 months"})
         self.client.create_incident.assert_not_called()
@@ -426,8 +427,8 @@ class TestRequestSqlitePersistence(_HandlerHarness):
                 state.transition_to(ConversationPhase.COLLECTING)
                 state.pending_action = "create_request"
                 state.collected_details = {
-                    "item_ref": "CAT0001", "sys_id": VISIO_SYS_ID,
-                    "item_name": "Microsoft Visio",
+                    "item_ref": "CAT0002", "sys_id": ACROBAT_SYS_ID,
+                    "item_name": "Adobe Acrobat Pro",
                     "variables": {"business_justification": "Diagrams"}}
                 state.transition_to(ConversationPhase.READY_FOR_CONFIRMATION)
                 state.transition_to(ConversationPhase.EXECUTING)
@@ -464,7 +465,7 @@ class TestRequestNumbers(_HandlerHarness):
     async def test_sys_id_only_is_never_displayed(self):
         reply = await self._confirm({"sys_id": RETURNED_SYS_ID})
         self.assertNotIn(RETURNED_SYS_ID, reply)
-        self.assertNotIn(VISIO_SYS_ID, reply)
+        self.assertNotIn(ACROBAT_SYS_ID, reply)
         self.assertIn("did not return a request number", reply)
         self.assertIn("do not submit it again", reply)
 
@@ -502,7 +503,7 @@ class TestSecondRequest(_HandlerHarness):
 
         # Request #2 in the same conversation starts a fresh collection.
         self.client.create_service_request.return_value = {"number": "REQ0012346"}
-        reply = await self._send("I need Microsoft Visio")
+        reply = await self._send("I need Adobe Acrobat Pro")
         self.assertNotIn("having trouble understanding", reply)
         self.assertIn("Business justification", reply)
         state = get_session(KEY)
@@ -526,7 +527,7 @@ class TestSecondRequest(_HandlerHarness):
 class TestSecondRequestAfterFailureOrCancel(_HandlerHarness):
 
     async def _second_request(self, justification="Second licence for a contractor"):
-        reply = await self._send("I need Microsoft Visio")
+        reply = await self._send("I need Adobe Acrobat Pro")
         self.assertNotIn("having trouble understanding", reply)
         self.assertIn("Business justification", reply)
         state = get_session(KEY)
@@ -569,12 +570,12 @@ class TestSecondRequestAfterFailureOrCancel(_HandlerHarness):
         cancelled = ConversationState()
         cancelled.transition_to(ConversationPhase.COLLECTING)
         cancelled.pending_action = "create_request"
-        cancelled.collected_details = {"item_ref": "CAT0002", "variables": {"department": "Old"}}
+        cancelled.collected_details = {"item_ref": "CAT0003", "variables": {"department": "Old"}}
         cancelled.transition_to(ConversationPhase.CANCELLED)
         save_session(KEY, cancelled)
         self.assertIn("REQ0012345", await self._second_request())
         self.client.create_service_request.assert_awaited_once_with(
-            sys_id=VISIO_SYS_ID,
+            sys_id=ACROBAT_SYS_ID,
             variables={"business_justification": "Second licence for a contractor",
                        "department": "Finance", "license_duration": "3 months"})
 
@@ -589,7 +590,7 @@ class TestRequestNotFound(_HandlerHarness):
         reply = await self._send("yes")
         self.assertTrue(reply.startswith("❌"))
         self.assertIn("No change was made", reply)
-        for leaked in (VISIO_SYS_ID, "REQ", "✅", "404", "sys_id", "incident"):
+        for leaked in (ACROBAT_SYS_ID, "REQ", "✅", "404", "sys_id", "incident"):
             self.assertNotIn(leaked, reply)
         self.assertIs(get_session(KEY).phase, ConversationPhase.FAILED)
         await self._send("yes")
@@ -679,13 +680,10 @@ class TestCatalogConfiguration(_HandlerHarness):
 
     async def test_configured_sys_id_is_sent_but_never_shown(self):
         self._env(f"CAT0001={CONFIGURED_SYS_ID}")
-        replies = [await self._send("I need Microsoft Visio")]
-        for answer in VISIO_TURNS:
-            replies.append(await self._send(answer))
+        replies = [await self._send("I need Microsoft Visio")]  # no questions: confirmation
         replies.append(await self._send("yes"))
-        self.client.create_service_request.assert_awaited_once()
-        self.assertEqual(self.client.create_service_request.await_args.kwargs["sys_id"],
-                         CONFIGURED_SYS_ID)
+        self.client.create_service_request.assert_awaited_once_with(
+            sys_id=CONFIGURED_SYS_ID, variables={})
         self.assertIn("REQ0012345", replies[-1])
         for reply in replies:
             self.assertNotIn(CONFIGURED_SYS_ID, reply)
@@ -696,7 +694,7 @@ class TestCatalogConfiguration(_HandlerHarness):
 
         self._env("CAT0001=not-a-real-sys-id")
         self.client.create_service_request.side_effect = ServiceNowNotFound("404")
-        await self._ready()
+        await self._send("I need Microsoft Visio")
         reply = await self._send("yes")
         # The invalid value is never used: the placeholder is sent, ServiceNow
         # rejects it, and the user gets the controlled "no change" reply.
@@ -708,6 +706,56 @@ class TestCatalogConfiguration(_HandlerHarness):
             self.assertNotIn(leaked, reply)
         await self._send("yes")
         self.client.create_service_request.assert_awaited_once()
+
+
+class TestNoVariableItem(_HandlerHarness):
+    """CAT0001 (Visio) maps to a ServiceNow item with no catalog variables."""
+
+    def test_fixture_visio_has_no_variables(self):
+        item = LocalCatalogRepository.from_fixture().get_item_by_ref("CAT0001")
+        self.assertEqual(item.name, "Microsoft Visio")
+        self.assertEqual(item.variables, ())
+
+    async def test_visio_goes_straight_to_confirmation(self):
+        reply = await self._send("I need Microsoft Visio")
+        self.assertIn("Request Confirmation", reply)
+        self.assertIn("**Microsoft Visio** (CAT0001)", reply)
+        self.assertIn("No extra options required", reply)
+        for question in ("Business justification", "business_justification",
+                         "Department", "License duration", "license_duration"):
+            self.assertNotIn(question, reply)
+        state = get_session(KEY)
+        self.assertIs(state.phase, ConversationPhase.READY_FOR_CONFIRMATION)
+        self.assertEqual(state.pending_action, "create_request")
+        self.assertEqual(state.collected_details["variables"], {})
+        self.client.create_service_request.assert_not_called()
+
+    async def test_visio_order_payload_has_empty_variables_and_runs_once(self):
+        await self._send("I need Microsoft Visio")
+        reply = await self._send("yes")
+        self.assertIn("REQ0012345", reply)
+        self.client.create_service_request.assert_awaited_once_with(
+            sys_id=VISIO_SYS_ID, variables={})
+        self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
+        # A repeated confirmation cannot create a second request.
+        await self._send("yes")
+        self.client.create_service_request.assert_awaited_once()
+
+    async def test_visio_survives_restart_on_sqlite(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.db"
+        repo = SqliteStateRepository(path)
+        configure_state_repository(repo)
+        await self._send("I need Microsoft Visio")
+        repo.close()
+        repo = SqliteStateRepository(path)
+        self.addCleanup(repo.close)
+        configure_state_repository(repo)
+        self.assertEqual(get_session(KEY).collected_details["variables"], {})
+        self.assertIn("REQ0012345", await self._send("yes"))
+        self.client.create_service_request.assert_awaited_once_with(
+            sys_id=VISIO_SYS_ID, variables={})
 
 
 class TestRequestUncertainOutcome(_HandlerHarness):
