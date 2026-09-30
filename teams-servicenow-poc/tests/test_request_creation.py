@@ -411,6 +411,24 @@ class TestRequestSqlitePersistence(_HandlerHarness):
         self.assertIs(state.phase, ConversationPhase.READY_FOR_CONFIRMATION)
         self.assertEqual(state.pending_action, "create_request")
 
+    def test_request_details_cleared_once_finished(self):
+        for terminal in (ConversationPhase.COMPLETED, ConversationPhase.FAILED):
+            with self.subTest(phase=terminal):
+                state = ConversationState()
+                state.transition_to(ConversationPhase.COLLECTING)
+                state.pending_action = "create_request"
+                state.collected_details = {
+                    "item_ref": "CAT0001", "sys_id": VISIO_SYS_ID,
+                    "item_name": "Microsoft Visio",
+                    "variables": {"business_justification": "Diagrams"}}
+                state.transition_to(ConversationPhase.READY_FOR_CONFIRMATION)
+                state.transition_to(ConversationPhase.EXECUTING)
+                state.transition_to(terminal)
+                self.repo.save(KEY, state)
+                self._restart()
+                self.assertEqual(get_session(KEY).collected_details, {})
+                self.assertEqual(self._stored()["collected_details"], {})
+
     def test_invalid_request_details_are_not_persisted(self):
         state = ConversationState(
             phase=ConversationPhase.COLLECTING, pending_action="create_request",
@@ -497,7 +515,140 @@ class TestSecondRequest(_HandlerHarness):
         self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
 
 
+class TestSecondRequestAfterFailureOrCancel(_HandlerHarness):
+
+    async def _second_request(self, justification="Second licence for a contractor"):
+        reply = await self._send("I need Microsoft Visio")
+        self.assertNotIn("having trouble understanding", reply)
+        self.assertIn("Business justification", reply)
+        state = get_session(KEY)
+        self.assertIs(state.phase, ConversationPhase.COLLECTING)
+        self.assertEqual(state.pending_action, "create_request")
+        self.assertEqual(state.collected_details["variables"], {})
+        for answer in (justification, "Finance", "3 months"):
+            reply = await self._send(answer)
+        self.assertIn(justification, reply)
+        self.assertNotIn("For drawing architecture charts", reply)
+        return await self._send("yes")
+
+    async def test_second_request_after_failed(self):
+        from app.servicenow import ServiceNowUnavailable
+
+        self.client.create_service_request.side_effect = [
+            ServiceNowUnavailable("down"), {"number": "REQ0012346"}]
+        await self._ready()
+        self.assertIn("No change was made", await self._send("yes"))
+        self.assertIs(get_session(KEY).phase, ConversationPhase.FAILED)
+        await self._send("yes")  # never retried
+        self.assertEqual(self.client.create_service_request.await_count, 1)
+
+        self.assertIn("REQ0012346", await self._second_request())
+        calls = self.client.create_service_request.await_args_list
+        self.assertEqual([c.kwargs["variables"]["business_justification"] for c in calls],
+                         ["For drawing architecture charts", "Second licence for a contractor"])
+        self.assertIs(get_session(KEY).phase, ConversationPhase.COMPLETED)
+
+    async def test_second_request_after_cancel_at_confirmation(self):
+        await self._ready()
+        self.assertIn("Cancelled", await self._send("cancel"))
+        self.client.create_service_request.assert_not_called()
+        self.assertIn("REQ0012345", await self._second_request())
+        self.client.create_service_request.assert_awaited_once()
+        variables = self.client.create_service_request.await_args.kwargs["variables"]
+        self.assertEqual(variables["business_justification"], "Second licence for a contractor")
+
+    async def test_second_request_from_persisted_cancelled_phase(self):
+        cancelled = ConversationState()
+        cancelled.transition_to(ConversationPhase.COLLECTING)
+        cancelled.pending_action = "create_request"
+        cancelled.collected_details = {"item_ref": "CAT0002", "variables": {"department": "Old"}}
+        cancelled.transition_to(ConversationPhase.CANCELLED)
+        save_session(KEY, cancelled)
+        self.assertIn("REQ0012345", await self._second_request())
+        self.client.create_service_request.assert_awaited_once_with(
+            sys_id=VISIO_SYS_ID,
+            variables={"business_justification": "Second licence for a contractor",
+                       "department": "Finance", "license_duration": "3 months"})
+
+
+class TestRequestNotFound(_HandlerHarness):
+
+    async def test_404_on_create_request_is_safe_and_not_retried(self):
+        from app.servicenow import ServiceNowNotFound
+
+        self.client.create_service_request.side_effect = ServiceNowNotFound("404")
+        await self._ready()
+        reply = await self._send("yes")
+        self.assertTrue(reply.startswith("❌"))
+        self.assertIn("No change was made", reply)
+        for leaked in (VISIO_SYS_ID, "REQ", "✅", "404", "sys_id", "incident"):
+            self.assertNotIn(leaked, reply)
+        self.assertIs(get_session(KEY).phase, ConversationPhase.FAILED)
+        await self._send("yes")
+        self.client.create_service_request.assert_awaited_once()
+        failed = self._audited(AuditEventType.REQUEST_CREATE_FAILED)
+        self.assertEqual([k["reason"] for k in failed], ["not_found"])
+
+
+class TestExecutingGuard(_HandlerHarness):
+
+    def _executing(self, pending_action):
+        state = ConversationState()
+        state.transition_to(ConversationPhase.COLLECTING)
+        state.pending_action = pending_action
+        state.collected_details = ({"item_ref": "CAT0001", "sys_id": VISIO_SYS_ID,
+                                    "item_name": "Microsoft Visio", "variables": {}}
+                                   if pending_action == "create_request" else {})
+        state.transition_to(ConversationPhase.READY_FOR_CONFIRMATION)
+        state.transition_to(ConversationPhase.EXECUTING)
+        save_session(KEY, state)
+
+    async def test_request_in_flight_says_service_request(self):
+        self._executing("create_request")
+        with patch.object(self.gateway, "execute", wraps=self.gateway.execute) as execute:
+            reply = await self._send("yes")
+        self.assertEqual(reply, "⏳ Your service request is still being created. "
+                                "Please wait for the result before sending another request.")
+        self.assertNotIn("incident", reply)
+        execute.assert_not_called()  # the gateway is not invoked again
+        self.client.create_service_request.assert_not_called()
+        self.classify.assert_not_called()
+        self.assertIs(get_session(KEY).phase, ConversationPhase.EXECUTING)
+
+    async def test_incident_in_flight_message_unchanged(self):
+        for pending in ("create_incident", "update_incident"):
+            with self.subTest(pending=pending):
+                self._executing(pending)
+                reply = await self._send("yes")
+                self.assertEqual(reply, "⏳ Your incident is still being created. "
+                                        "Please wait for the result before sending another "
+                                        "request.")
+        self.client.create_service_request.assert_not_called()
+
+
 class TestRequestUncertainOutcome(_HandlerHarness):
+
+    def test_unknown_write_operation_never_raises(self):
+        for category in ServiceNowErrorCategory:
+            with self.subTest(category=category):
+                message = failure_message(category, operation="escalate",
+                                          possibly_applied=True)
+                self.assertIn("couldn't confirm whether the change was made", message)
+                self.assertIn("may or may not have been applied", message)
+                self.assertIn("check ServiceNow before trying again", message)
+                self.assertIn("won't retry automatically", message)
+                self.assertNotIn("incident", message)
+                self.assertIsInstance(
+                    failure_message(category, operation="escalate"), str)
+
+    def test_create_request_message_unchanged(self):
+        self.assertEqual(
+            failure_message(ServiceNowErrorCategory.TIMEOUT, operation="create_request",
+                            possibly_applied=True),
+            "ServiceNow didn't respond in time. I couldn't confirm whether your service "
+            "request was created — it may or may not exist. Please check your requests in "
+            "ServiceNow before trying again. I won't retry automatically.")
+
 
     create_result = ServiceNowTimeout("timed out", possibly_applied=True)
 

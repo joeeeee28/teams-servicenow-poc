@@ -165,6 +165,13 @@ _UNCONFIRMED = {
     "update": _UNCONFIRMED_UPDATE,
     "create_request": _UNCONFIRMED_CREATE_REQUEST,   # DEMO-06
 }
+# Any other write operation: still honest ("may have applied", check first,
+# no automatic retry) — never a KeyError on the failure path.
+_UNCONFIRMED_GENERIC = (
+    "{reason} I couldn't confirm whether the change was made in ServiceNow — it may "
+    "or may not have been applied. Please check ServiceNow before trying again. "
+    "I won't retry automatically."
+)
 
 
 def failure_message(
@@ -188,5 +195,5 @@ def failure_message(
         return _READ[category].format(n=n)
     if possibly_applied:
         reason = _UNCONFIRMED_REASON.get(category, "ServiceNow didn't confirm the result.")
-        return _UNCONFIRMED[operation].format(reason=reason, n=n)
+        return _UNCONFIRMED.get(operation, _UNCONFIRMED_GENERIC).format(reason=reason, n=n)
     return _NOT_APPLIED[category].format(n=n)

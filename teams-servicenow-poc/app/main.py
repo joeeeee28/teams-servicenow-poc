@@ -447,10 +447,17 @@ async def _handle_message(context):
 
         if session.phase is ConversationPhase.EXECUTING:
 
-            await context.send(
-                "⏳ Your incident is still being created. "
-                "Please wait for the result before sending another request."
-            )
+            if session.pending_action == CREATE_REQUEST_ACTION:
+                # DEMO-06: a service request is in flight.
+                await context.send(
+                    "⏳ Your service request is still being created. "
+                    "Please wait for the result before sending another request."
+                )
+            else:
+                await context.send(
+                    "⏳ Your incident is still being created. "
+                    "Please wait for the result before sending another request."
+                )
 
             return
 

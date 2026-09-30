@@ -859,9 +859,9 @@ BL-003 confirmation, BL-004 authorization, BL-005 Tool Gateway
 | Field | Rule |
 |---|---|
 | `phase` | a `ConversationPhase` value |
-| `pending_action` | `create_incident` / `update_incident` only |
+| `pending_action` | `create_incident` / `update_incident` / `create_request` (DEMO-06) only |
 | `intent` | known intents only (else dropped) |
-| `collected_details` | create: `short_description`, `description`, `impact`, `urgency` (strings). Update: `changes` / `current` (same fields) and `requested` (field names). Every other key is dropped. Kept **only while the operation is in progress** (COLLECTING → EXECUTING); a `COMPLETED` or `FAILED` record stores `{}`, and such details are ignored on load. |
+| `collected_details` | create: `short_description`, `description`, `impact`, `urgency` (strings). Update: `changes` / `current` (same fields) and `requested` (field names). DEMO-06 service request: `item_ref` (`CAT` + 4 digits), `sys_id` (32 lower-case hex characters; never displayed), `item_name` (non-empty, ≤ 80 chars) and `variables` (at most 8 entries; names match `^[a-z][a-z0-9_]{1,39}$`; string values ≤ 500 chars). Any key or value that fails validation, and every other key, is dropped. Kept **only while the operation is in progress** (COLLECTING → EXECUTING); a `COMPLETED` or `FAILED` record stores `{}`, and such details are ignored on load. |
 | `incident_number` | `INC` + 7–10 digits only |
 | `correlation_id` | plain identifier only (BL-010) |
 | `last_error` | the gateway's fixed safe message, ≤ 500 chars |
@@ -875,7 +875,9 @@ BL-003 confirmation, BL-004 authorization, BL-005 Tool Gateway
   and `description` are, however, taken from what the user typed. For a
   create request given in one message, they are close to that message's text.
   They are needed to carry collection across messages (and restarts) up to
-  confirmation, and are dropped once the operation completes or fails.
+  confirmation, and are dropped once the operation completes or fails. The
+  same applies to DEMO-06 request `variables` (e.g. a business
+  justification).
 - Access or OAuth tokens, API keys, passwords, secrets and `Authorization`
   headers. None of them are part of `ConversationState`, and serialization is
   an allowlist.
