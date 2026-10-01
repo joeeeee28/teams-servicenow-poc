@@ -328,7 +328,8 @@ class TestUnknownActionDenied(unittest.TestCase):
     def test_9_all_actions_in_enum(self):
         expected = {
             "read_incident", "create_incident", "update_incident",
-            "read_knowledge", "create_request", "escalate", "admin_override",
+            "read_knowledge", "create_request", "read_request_status",
+            "escalate", "admin_override",
         }
         actual = {a.value for a in AuthorizableAction}
         self.assertEqual(actual, expected)
@@ -497,7 +498,7 @@ class TestArbitraryActionDenied(unittest.TestCase):
 
     def test_14_action_enum_is_exhaustive(self):
         """All actions are explicitly enumerated — no catch-all."""
-        self.assertEqual(len(AuthorizableAction), 7)
+        self.assertEqual(len(AuthorizableAction), 8)
 
 
 # ===========================================================================

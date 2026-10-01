@@ -12,6 +12,8 @@ from app.tools.servicenow import (
     CreateIncidentToolRequest,
     CreateRequestToolRequest,
     GetIncidentToolRequest,
+    GetRequestStatusToolRequest,
+    GetRitmStatusToolRequest,
     SearchCatalogToolRequest,
     ServiceNowToolAction,
     ServiceNowToolGateway,
@@ -27,6 +29,8 @@ from app.tools.servicenow import (
 __all__ = [
     "ServiceNowToolAction",
     "GetIncidentToolRequest",
+    "GetRequestStatusToolRequest",
+    "GetRitmStatusToolRequest",
     "CreateIncidentToolRequest",
     "UpdateIncidentToolRequest",
     "SearchCatalogToolRequest",

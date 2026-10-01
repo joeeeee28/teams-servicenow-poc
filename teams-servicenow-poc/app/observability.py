@@ -115,11 +115,11 @@ _ALLOWED_OUTCOMES: dict[ObsEventName, frozenset[ObsOutcome]] = {
 # read-only knowledge search.
 OPERATIONS = frozenset({"get_incident", "create_incident", "update_incident",
                         "knowledge_search", "historical_case_search", "search_catalog",
-                        "create_request"})
+                        "create_request", "get_request_status", "get_ritm_status"})
 
 # The ONLY metadata keys, each with its enumerated values.
 APPROVED_METADATA: dict[str, frozenset[str]] = {
-    "route": frozenset({"incident_status", "incident_update", "none"}),
+    "route": frozenset({"incident_status", "incident_update", "request_status", "ritm_status", "none"}),
     "intent": frozenset({
         "diagnose", "find_solution", "create_incident", "incident_status",
         "service_request", "human_escalation", "general",

@@ -156,6 +156,8 @@ def _transport_error(exc: httpx.HTTPError, *, what: str, write_sent: bool) -> Se
 
 # Incident numbers must be INC followed by exactly 7 to 10 digits.
 _INCIDENT_NUMBER_RE = re.compile(r"^INC\d{7,10}$")
+_REQUEST_NUMBER_RE = re.compile(r"^REQ\d{7,10}$")
+_RITM_NUMBER_RE = re.compile(r"^RITM\d{7,10}$")
 
 
 def _validate_incident_number(incident_number: str) -> str:
@@ -173,6 +175,30 @@ def _validate_incident_number(incident_number: str) -> str:
     if not _INCIDENT_NUMBER_RE.fullmatch(normalised):
         raise ValueError(
             "Incident number must be INC followed by 7 to 10 digits."
+        )
+    return normalised
+
+
+def _validate_request_number(request_number: str) -> str:
+    """
+    Normalise and validate a ServiceNow Service Request (REQ) number.
+    """
+    normalised = request_number.strip().upper()
+    if not _REQUEST_NUMBER_RE.fullmatch(normalised):
+        raise ValueError(
+            "Request number must be REQ followed by 7 to 10 digits."
+        )
+    return normalised
+
+
+def _validate_ritm_number(ritm_number: str) -> str:
+    """
+    Normalise and validate a ServiceNow Requested Item (RITM) number.
+    """
+    normalised = ritm_number.strip().upper()
+    if not _RITM_NUMBER_RE.fullmatch(normalised):
+        raise ValueError(
+            "RITM number must be RITM followed by 7 to 10 digits."
         )
     return normalised
 
@@ -708,3 +734,59 @@ class ServiceNowClient:
         )
 
         return self._record(response, write=True)
+
+    async def get_request_status(
+        self,
+        request_number: str,
+    ) -> dict:
+        """
+        Find a Service Request (REQ) using its REQ number.
+        """
+        normalised = _validate_request_number(request_number)
+        url = f"{self.instance}/api/now/table/sc_request"
+        params = {
+            "sysparm_query": f"number={normalised}",
+            "sysparm_fields": "sys_id,number,short_description,request_state,stage,approval,opened_by,requested_for",
+            "sysparm_limit": "1",
+        }
+        response = await self._request("GET", url, params=params)
+        results = response.get("result", [])
+
+        if not isinstance(results, list):
+            raise ServiceNowInvalidResponse("ServiceNow lookup result was not a list")
+
+        if not results:
+            raise ServiceNowNotFound("The requested service request was not found.")
+
+        if not isinstance(results[0], dict):
+            raise ServiceNowInvalidResponse("ServiceNow lookup record was not an object")
+
+        return results[0]
+
+    async def get_ritm_status(
+        self,
+        ritm_number: str,
+    ) -> dict:
+        """
+        Find a Requested Item (RITM) using its RITM number.
+        """
+        normalised = _validate_ritm_number(ritm_number)
+        url = f"{self.instance}/api/now/table/sc_req_item"
+        params = {
+            "sysparm_query": f"number={normalised}",
+            "sysparm_fields": "sys_id,number,short_description,state,stage,approval,request,opened_by,requested_for,cat_item",
+            "sysparm_limit": "1",
+        }
+        response = await self._request("GET", url, params=params)
+        results = response.get("result", [])
+
+        if not isinstance(results, list):
+            raise ServiceNowInvalidResponse("ServiceNow lookup result was not a list")
+
+        if not results:
+            raise ServiceNowNotFound("The requested item (RITM) was not found.")
+
+        if not isinstance(results[0], dict):
+            raise ServiceNowInvalidResponse("ServiceNow lookup record was not an object")
+
+        return results[0]

@@ -69,6 +69,23 @@ _INCIDENT_STATUS_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+_REQUEST_STATUS_RE = re.compile(
+    r"""
+    \A                              # start of string (after strip)
+    (?:                             # optional approved lead-in
+        (?:what\s+is\s+the\s+)?     # "what is the " (optional)
+        (?:check\s+)?               # "check " (optional)
+        status\s+(?:of\s+)?         # "status " or "status of "
+        |
+        check\s+                    # bare "check "
+    )?
+    ((?:REQ|RITM)\d{7,10})          # capture group 1: REQ or RITM number
+    (?:\s+status)?                  # optional trailing " status"
+    \Z                              # end of string — no trailing content allowed
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -77,22 +94,33 @@ _INCIDENT_STATUS_RE = re.compile(
 class RouteResult:
     """Lightweight, immutable-by-convention result object."""
 
-    __slots__ = ("intent", "incident_number")
+    __slots__ = ("intent", "incident_number", "request_number")
 
-    def __init__(self, intent: str, incident_number: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        intent: str,
+        incident_number: Optional[str] = None,
+        request_number: Optional[str] = None,
+    ) -> None:
         self.intent = intent
         self.incident_number = incident_number
+        self.request_number = request_number
 
     def __repr__(self) -> str:
         return (
             f"RouteResult(intent={self.intent!r}, "
-            f"incident_number={self.incident_number!r})"
+            f"incident_number={self.incident_number!r}, "
+            f"request_number={self.request_number!r})"
         )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, RouteResult):
             return NotImplemented
-        return self.intent == other.intent and self.incident_number == other.incident_number
+        return (
+            self.intent == other.intent
+            and self.incident_number == other.incident_number
+            and self.request_number == other.request_number
+        )
 
 
 def route_message(message: str) -> Optional[RouteResult]:
@@ -122,6 +150,13 @@ def route_message(message: str) -> Optional[RouteResult]:
         # Normalise to upper-case regardless of how the user typed it.
         incident_number = m.group(1).upper()
         return RouteResult(intent="incident_status", incident_number=incident_number)
+
+    # ── Request-status (REQ or RITM) ─────────────────────────────────────────
+    m_req = _REQUEST_STATUS_RE.fullmatch(normalised)
+    if m_req:
+        req_number = m_req.group(1).upper()
+        intent = "request_status" if req_number.startswith("REQ") else "ritm_status"
+        return RouteResult(intent=intent, request_number=req_number)
 
     # ── Incident update (BL-009) ─────────────────────────────────────────────
     # Whole-message grammar in app.incident_update; never executes anything —

@@ -115,6 +115,9 @@ class AuthorizableAction(str, Enum):
     CREATE_REQUEST = "create_request"
     """Submit a service catalog request."""
 
+    READ_REQUEST_STATUS = "read_request_status"
+    """Read the details or status of an existing service request or item."""
+
     ESCALATE = "escalate"
     """Escalate an issue to a human IT support agent."""
 
@@ -246,6 +249,7 @@ _POLICY_MATRIX: dict[UserRole, frozenset[AuthorizableAction]] = {
             AuthorizableAction.READ_KNOWLEDGE,
             AuthorizableAction.CREATE_INCIDENT,
             AuthorizableAction.CREATE_REQUEST,
+            AuthorizableAction.READ_REQUEST_STATUS,
             AuthorizableAction.ESCALATE,
         }
     ),
@@ -255,6 +259,7 @@ _POLICY_MATRIX: dict[UserRole, frozenset[AuthorizableAction]] = {
             AuthorizableAction.READ_KNOWLEDGE,
             AuthorizableAction.CREATE_INCIDENT,
             AuthorizableAction.CREATE_REQUEST,
+            AuthorizableAction.READ_REQUEST_STATUS,
             AuthorizableAction.ESCALATE,
             AuthorizableAction.UPDATE_INCIDENT,  # agent-only
         }
@@ -265,6 +270,7 @@ _POLICY_MATRIX: dict[UserRole, frozenset[AuthorizableAction]] = {
             AuthorizableAction.READ_KNOWLEDGE,
             AuthorizableAction.CREATE_INCIDENT,
             AuthorizableAction.CREATE_REQUEST,
+            AuthorizableAction.READ_REQUEST_STATUS,
             AuthorizableAction.ESCALATE,
             AuthorizableAction.UPDATE_INCIDENT,
             AuthorizableAction.ADMIN_OVERRIDE,   # admin-only

@@ -112,6 +112,13 @@ class AuditEventType(str, Enum):
     REQUEST_CREATE_COMPLETED = "request_create_completed"
     REQUEST_CREATE_FAILED = "request_create_failed"
 
+    # DEMO-07: service request & RITM status lookup.
+    REQUEST_READ_REQUESTED = "request_read_requested"
+    REQUEST_READ_AUTHORIZED = "request_read_authorized"
+    REQUEST_READ_DENIED = "request_read_denied"
+    REQUEST_READ_COMPLETED = "request_read_completed"
+    REQUEST_READ_FAILED = "request_read_failed"
+
 
 class AuditOutcome(str, Enum):
     REQUESTED = "requested"
@@ -156,7 +163,7 @@ DEFAULT_OUTCOME: dict[AuditEventType, AuditOutcome] = {
 # DEMO-03 read-only knowledge search.
 AUDIT_TOOLS = frozenset({"get_incident", "create_incident", "update_incident",
                          "knowledge_search", "historical_case_search", "search_catalog",
-                         "create_request"})
+                         "create_request", "get_request_status", "get_ritm_status"})
 MAX_AUDIT_ARTICLES = 5
 MAX_AUDIT_ITEMS = 10
 

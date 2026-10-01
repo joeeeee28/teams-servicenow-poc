@@ -84,6 +84,8 @@ class ServiceNowToolAction(str, Enum):
     UPDATE_INCIDENT = "update_incident"
     SEARCH_CATALOG = "search_catalog"      # DEMO-05, read-only
     CREATE_REQUEST = "create_request"      # DEMO-06, service request creation
+    GET_REQUEST_STATUS = "get_request_status"  # DEMO-07, read-only REQ status
+    GET_RITM_STATUS = "get_ritm_status"        # DEMO-07, read-only RITM status
 
 
 # Mapping from ServiceNowToolAction to the required AuthorizableAction
@@ -93,6 +95,8 @@ _ACTION_MAPPING: dict[ServiceNowToolAction, AuthorizableAction] = {
     ServiceNowToolAction.UPDATE_INCIDENT: AuthorizableAction.UPDATE_INCIDENT,
     ServiceNowToolAction.SEARCH_CATALOG: AuthorizableAction.READ_KNOWLEDGE,
     ServiceNowToolAction.CREATE_REQUEST: AuthorizableAction.CREATE_REQUEST,
+    ServiceNowToolAction.GET_REQUEST_STATUS: AuthorizableAction.READ_REQUEST_STATUS,
+    ServiceNowToolAction.GET_RITM_STATUS: AuthorizableAction.READ_REQUEST_STATUS,
 }
 
 
@@ -198,6 +202,60 @@ class GetIncidentToolRequest:
         normalised = self.incident_number.strip().upper()
         if not _INCIDENT_NUMBER_RE.fullmatch(normalised):
             raise ToolValidationError("Incident number must be INC followed by 7 to 10 digits.")
+        return normalised
+
+
+@dataclass(frozen=True)
+class GetRequestStatusToolRequest:
+    """
+    Request contract for GET_REQUEST_STATUS.
+
+    Fields
+    ──────
+    request_number : str
+        ServiceNow request number (e.g. REQ0010005).
+    """
+
+    request_number: str
+
+    def validate(self) -> str:
+        """
+        Validate and return normalized request_number.
+        Raises ToolValidationError on format error.
+        """
+        if not self.request_number or not isinstance(self.request_number, str):
+            raise ToolValidationError("Request number must be a non-empty string.")
+
+        normalised = self.request_number.strip().upper()
+        if not _REQUEST_NUMBER_RE.fullmatch(normalised):
+            raise ToolValidationError("Request number must be REQ followed by 7 to 10 digits.")
+        return normalised
+
+
+@dataclass(frozen=True)
+class GetRitmStatusToolRequest:
+    """
+    Request contract for GET_RITM_STATUS.
+
+    Fields
+    ──────
+    ritm_number : str
+        ServiceNow RITM number (e.g. RITM0010005).
+    """
+
+    ritm_number: str
+
+    def validate(self) -> str:
+        """
+        Validate and return normalized ritm_number.
+        Raises ToolValidationError on format error.
+        """
+        if not self.ritm_number or not isinstance(self.ritm_number, str):
+            raise ToolValidationError("RITM number must be a non-empty string.")
+
+        normalised = self.ritm_number.strip().upper()
+        if not _RITM_NUMBER_RE.fullmatch(normalised):
+            raise ToolValidationError("RITM number must be RITM followed by 7 to 10 digits.")
         return normalised
 
 
@@ -657,6 +715,12 @@ class ServiceNowToolGateway:
             elif tool_action is ServiceNowToolAction.CREATE_REQUEST:
                 return await self._execute_create_request(identity, request)
 
+            elif tool_action is ServiceNowToolAction.GET_REQUEST_STATUS:
+                return await self._execute_get_request_status(identity, request)
+
+            elif tool_action is ServiceNowToolAction.GET_RITM_STATUS:
+                return await self._execute_get_ritm_status(identity, request)
+
             else:
                 raise ToolValidationError(f"Unsupported tool action: {tool_action!r}")
 
@@ -880,3 +944,55 @@ class ServiceNowToolGateway:
             # Never retried: a request creation is not idempotent.
             raise (_servicenow_failure(exc, operation="create_request")
                    or ToolExecutionError("Failed to create request in ServiceNow.")) from None
+
+    async def _execute_get_request_status(
+        self,
+        identity: UserIdentity,
+        request: Any,
+    ) -> ToolResult:
+        """Execute GET_REQUEST_STATUS tool operation."""
+        if not isinstance(request, GetRequestStatusToolRequest):
+            raise ToolValidationError("Request must be an instance of GetRequestStatusToolRequest.")
+
+        normalised_num = request.validate()
+        client = self._get_client()
+
+        try:
+            result = await client.get_request_status(normalised_num)
+            return ToolResult.ok(
+                action=ServiceNowToolAction.GET_REQUEST_STATUS,
+                safe_message=f"Service request {normalised_num} retrieved successfully.",
+                request_number=normalised_num,
+                incident=result,
+            )
+        except ServiceNowNotFound:
+            raise ToolNotFoundError(f"Service request {normalised_num} was not found.")
+        except ServiceNowError as exc:
+            raise (_servicenow_failure(exc, operation="read")
+                   or ToolExecutionError("Failed to retrieve service request from ServiceNow.")) from None
+
+    async def _execute_get_ritm_status(
+        self,
+        identity: UserIdentity,
+        request: Any,
+    ) -> ToolResult:
+        """Execute GET_RITM_STATUS tool operation."""
+        if not isinstance(request, GetRitmStatusToolRequest):
+            raise ToolValidationError("Request must be an instance of GetRitmStatusToolRequest.")
+
+        normalised_num = request.validate()
+        client = self._get_client()
+
+        try:
+            result = await client.get_ritm_status(normalised_num)
+            return ToolResult.ok(
+                action=ServiceNowToolAction.GET_RITM_STATUS,
+                safe_message=f"Requested item {normalised_num} retrieved successfully.",
+                ritm_number=normalised_num,
+                incident=result,
+            )
+        except ServiceNowNotFound:
+            raise ToolNotFoundError(f"Requested item {normalised_num} was not found.")
+        except ServiceNowError as exc:
+            raise (_servicenow_failure(exc, operation="read")
+                   or ToolExecutionError("Failed to retrieve requested item from ServiceNow.")) from None

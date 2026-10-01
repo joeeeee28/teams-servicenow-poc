@@ -669,10 +669,11 @@ class TestGateway(unittest.IsolatedAsyncioTestCase):
         for extra in ("table", "path", "query", "sysparm_query", "url"):
             with self.subTest(extra=extra), self.assertRaises(TypeError):
                 UpdateIncidentToolRequest("INC0010002", impact="1", **{extra: "sys_user"})
-        # DEMO-06 added create_request; the allowlist stays closed.
+        # DEMO-07 added get_request_status and get_ritm_status; the allowlist stays closed.
         self.assertEqual([m.value for m in ServiceNowToolAction],
                          ["get_incident", "create_incident", "update_incident",
-                          "search_catalog", "create_request"])
+                          "search_catalog", "create_request",
+                          "get_request_status", "get_ritm_status"])
 
 
 # ===========================================================================

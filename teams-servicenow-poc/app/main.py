@@ -46,6 +46,13 @@ from app.incident_status import (
     lookup_failed_message,
     not_found_message,
 )
+from app.request_status import (
+    NOT_AUTHORISED_REQUEST_MESSAGE,
+    format_request_status,
+    format_ritm_status,
+    request_lookup_failed_message,
+    request_not_found_message,
+)
 from app.incident_update import (
     UPDATE_INCIDENT_ACTION,
     current_values,
@@ -89,6 +96,8 @@ from app.tools import (
     CreateIncidentToolRequest,
     CreateRequestToolRequest,
     GetIncidentToolRequest,
+    GetRequestStatusToolRequest,
+    GetRitmStatusToolRequest,
     SearchCatalogToolRequest,
     UpdateIncidentToolRequest,
     ServiceNowToolAction,
@@ -485,6 +494,14 @@ async def _handle_message(context):
 
             await context.send(
                 await _lookup_incident_status(context, route.incident_number)
+            )
+
+            return
+
+        if route is not None and route.intent in ("request_status", "ritm_status"):
+
+            await context.send(
+                await _lookup_request_status(context, route.request_number)
             )
 
             return
@@ -1441,6 +1458,91 @@ async def _lookup_incident_status(context, incident_number: str) -> str:
     )
 
     return _read_failure_reply(tool_result, incident_number)
+
+
+# ============================================================
+# DEMO-07: SERVICE REQUEST STATUS LOOKUP (REQ & RITM)
+# ============================================================
+
+async def _lookup_request_status(context, request_number: str) -> str:
+    """
+    Read one REQ or RITM through the Tool Gateway and return the Teams reply.
+
+    identity → authorize(READ_REQUEST_STATUS) → gateway GET_REQUEST_STATUS /
+    GET_RITM_STATUS (once, never retried).
+    """
+    correlation_id = _audit_request_id()
+    norm_number = request_number.strip().upper()
+    is_req = norm_number.startswith("REQ")
+    action_authz = AuthorizableAction.READ_REQUEST_STATUS
+
+    safe_num = safe_ref(norm_number) or norm_number
+    read = dict(
+        correlation_id=correlation_id,
+        action=action_authz,
+    )
+    _audit(AuditEventType.REQUEST_READ_REQUESTED, context, **read)
+
+    identity = resolve_identity(
+        context.activity,
+        channel_tenant_id=_channel_tenant_id(context.activity),
+    )
+    authz = _authorize(identity, action_authz)
+
+    if not authz.allowed:
+        logger.warning(
+            "authorization denied for user=%r action=%r",
+            identity.user_id,
+            action_authz.value,
+        )
+        _audit(AuditEventType.REQUEST_READ_DENIED, context, **read)
+        return NOT_AUTHORISED_REQUEST_MESSAGE
+
+    _audit(AuditEventType.REQUEST_READ_AUTHORIZED, context, **read)
+
+    tool_action = (
+        ServiceNowToolAction.GET_REQUEST_STATUS
+        if is_req
+        else ServiceNowToolAction.GET_RITM_STATUS
+    )
+    read["tool"] = tool_action.value
+
+    tool_req = (
+        GetRequestStatusToolRequest(request_number=norm_number)
+        if is_req
+        else GetRitmStatusToolRequest(ritm_number=norm_number)
+    )
+
+    try:
+        tool_result = await servicenow_gateway.execute(
+            identity,
+            authz,
+            tool_action,
+            tool_req,
+            correlation_id=correlation_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "request status lookup: gateway raised %s for user=%r",
+            type(exc).__name__,
+            identity.user_id,
+        )
+        _audit(AuditEventType.REQUEST_READ_FAILED, context, reason="execution_error", **read)
+        return request_lookup_failed_message(norm_number)
+
+    if tool_result.success and tool_result.incident:
+        _audit(AuditEventType.REQUEST_READ_COMPLETED, context, **read)
+        if is_req:
+            return format_request_status(tool_result.incident, norm_number)
+        return format_ritm_status(tool_result.incident, norm_number)
+
+    _audit(
+        AuditEventType.REQUEST_READ_FAILED, context,
+        reason=_failure_reason(tool_result) if not tool_result.success else "empty_result",
+        **read,
+    )
+
+    return request_not_found_message(norm_number)
 
 
 # ============================================================
